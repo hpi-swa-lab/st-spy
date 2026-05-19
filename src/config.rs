@@ -6,27 +6,19 @@ use clap::{
 };
 use remoteprocess::Pid;
 
-/// Options on how to collect samples from a python process
+/// Options on how to collect samples from an OpenSmalltalk VM process.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// Whether or not we should stop the python process when taking samples.
-    /// Setting this to false will reduce the performance impact on the target
-    /// python process, but can lead to incorrect results like partial stack
-    /// traces being returned or a higher sampling error rate
+    /// Whether or not we should stop the target process when taking samples.
+    /// Setting this to false reduces sampling impact but can lead to partial stacks.
     pub blocking: LockingStrategy,
 
-    /// Whether or not to profile native extensions. Note: this option can not be
-    /// used with the nonblocking option, as we have to pause the process to collect
-    /// the native stack traces
-    pub native: bool,
-
-    // The following config options only apply when using py-spy as an application
     #[doc(hidden)]
     pub command: String,
     #[doc(hidden)]
     pub pid: Option<Pid>,
     #[doc(hidden)]
-    pub python_program: Option<Vec<String>>,
+    pub program: Option<Vec<String>>,
     #[doc(hidden)]
     pub sampling_rate: u64,
     #[doc(hidden)]
@@ -44,23 +36,15 @@ pub struct Config {
     #[doc(hidden)]
     pub subprocesses: bool,
     #[doc(hidden)]
-    pub gil_only: bool,
-    #[doc(hidden)]
     pub hide_progress: bool,
     #[doc(hidden)]
     pub capture_output: bool,
     #[doc(hidden)]
     pub dump_json: bool,
     #[doc(hidden)]
-    pub dump_locals: u64,
-    #[doc(hidden)]
     pub full_filenames: bool,
     #[doc(hidden)]
-    pub lineno: LineNo,
-    #[doc(hidden)]
     pub refresh_seconds: f64,
-    #[doc(hidden)]
-    pub core_filename: Option<String>,
 }
 
 #[allow(non_camel_case_types)]
@@ -89,7 +73,6 @@ impl std::str::FromStr for FileFormat {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum LockingStrategy {
-    NonBlocking,
     #[allow(dead_code)]
     AlreadyLocked,
     Lock,
@@ -101,20 +84,11 @@ pub enum RecordDuration {
     Seconds(u64),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Copy)]
-pub enum LineNo {
-    NoLine,
-    First,
-    LastInstruction,
-}
-
 impl Default for Config {
-    /// Initializes a new Config object with default parameters
-    #[allow(dead_code)]
     fn default() -> Config {
         Config {
             pid: None,
-            python_program: None,
+            program: None,
             filename: None,
             format: None,
             command: String::from("top"),
@@ -122,58 +96,42 @@ impl Default for Config {
             show_line_numbers: false,
             sampling_rate: 100,
             duration: RecordDuration::Unlimited,
-            native: false,
-            gil_only: false,
             include_idle: false,
             include_thread_ids: false,
             hide_progress: false,
             capture_output: true,
             dump_json: false,
-            dump_locals: 0,
             subprocesses: false,
             full_filenames: false,
-            lineno: LineNo::LastInstruction,
             refresh_seconds: 1.0,
-            core_filename: None,
         }
     }
 }
 
 #[cfg(feature = "cli")]
 impl Config {
-    /// Uses clap to set config options from commandline arguments
+    /// Uses clap to set config options from command line arguments.
     pub fn from_commandline() -> Config {
         let args: Vec<String> = std::env::args().collect();
         Config::from_args(&args).unwrap_or_else(|e| e.exit())
     }
 
     pub fn from_args(args: &[String]) -> clap::error::Result<Config> {
-        // pid/native/nonblocking/rate/python_program/subprocesses/full_filenames arguments can be
-        // used across various subcommand - define once here
         let pid = Arg::new("pid")
             .short('p')
             .long("pid")
             .value_name("pid")
-            .help("PID of a running python program to spy on, in decimal or hex")
+            .help("PID of a running OpenSmalltalk VM to sample, in decimal or hex")
             .action(ArgAction::Set);
 
-        let mut native = Arg::new("native")
-            .short('n')
-            .long("native")
-            .help("Collect stack traces from native extensions written in Cython, C or C++")
-            .action(ArgAction::SetTrue);
-
-        // Only show `--native` on platforms where it's supported
-        if !cfg!(feature = "unwind") {
-            native = native.hide(true);
-        }
-
-        #[cfg(not(target_os="freebsd"))]
+        #[cfg(not(target_os = "freebsd"))]
         let nonblocking = Arg::new("nonblocking")
-                    .long("nonblocking")
-                    .help("Don't pause the python process when collecting samples. Setting this option will reduce \
-                          the performance impact of sampling, but may lead to inaccurate results")
-                    .action(ArgAction::SetTrue);
+            .long("nonblocking")
+            .help(
+                "Don't pause the target process when collecting samples. This reduces sampling \
+                 impact, but may produce inaccurate stacks",
+            )
+            .action(ArgAction::SetTrue);
 
         let rate = Arg::new("rate")
             .short('r')
@@ -192,10 +150,14 @@ impl Config {
 
         let full_filenames = Arg::new("full_filenames")
             .long("full-filenames")
-            .help("Show full Python filenames, instead of shortening to show only the package part")
+            .help("Show full source filenames instead of shortening to the basename")
             .action(ArgAction::SetTrue);
-        let program = Arg::new("python_program")
-            .help("commandline of a python program to run")
+
+        let program = Arg::new("program")
+            .help("Command line of an OpenSmalltalk VM to run")
+            .num_args(1..)
+            .trailing_var_arg(true)
+            .allow_hyphen_values(true)
             .action(ArgAction::Append);
 
         let idle = Arg::new("idle")
@@ -204,24 +166,18 @@ impl Config {
             .help("Include stack traces for idle threads")
             .action(ArgAction::SetTrue);
 
-        let gil = Arg::new("gil")
-            .short('g')
-            .long("gil")
-            .help("Only include traces that are holding on to the GIL")
-            .action(ArgAction::SetTrue);
-
         let top_delay = Arg::new("delay")
             .long("delay")
             .value_name("seconds")
-            .help("Delay between 'top' refreshes.")
+            .help("Delay between top refreshes")
             .default_value("1.0")
             .value_parser(clap::value_parser!(f64))
             .action(ArgAction::Set);
 
         let record = Command::new("record")
-            .about("Records stack trace information to a flamegraph, speedscope or raw file")
+            .about("Record stack traces to a flamegraph, speedscope, raw, or chrome trace file")
             .arg(program.clone())
-            .arg(pid.clone().required_unless_present("python_program"))
+            .arg(pid.clone().required_unless_present("program"))
             .arg(full_filenames.clone())
             .arg(
                 Arg::new("output")
@@ -254,9 +210,6 @@ impl Config {
             )
             .arg(rate.clone())
             .arg(subprocesses.clone())
-            .arg(Arg::new("function").short('F').long("function").help(
-                "Aggregate samples by function's first line number, instead of current line number",
-            ).action(ArgAction::SetTrue))
             .arg(
                 Arg::new("nolineno")
                     .long("nolineno")
@@ -270,65 +223,43 @@ impl Config {
                     .help("Show thread ids in the output")
                     .action(ArgAction::SetTrue),
             )
-            .arg(gil.clone())
             .arg(idle.clone())
             .arg(
                 Arg::new("capture")
                     .long("capture")
                     .hide(true)
-                    .help("Captures output from child process")
+                    .help("Capture output from child process")
                     .action(ArgAction::SetTrue),
             )
             .arg(
                 Arg::new("hideprogress")
                     .long("hideprogress")
                     .hide(true)
-                    .help("Hides progress bar (useful for showing error output on record)")
+                    .help("Hide progress bar")
                     .action(ArgAction::SetTrue),
             );
 
         let top = Command::new("top")
-            .about("Displays a top like view of functions consuming CPU")
+            .about("Display a top-like view of functions consuming CPU")
             .arg(program.clone())
-            .arg(pid.clone().required_unless_present("python_program"))
+            .arg(pid.clone().required_unless_present("program"))
             .arg(rate.clone())
             .arg(subprocesses.clone())
             .arg(full_filenames.clone())
-            .arg(gil.clone())
             .arg(idle.clone())
             .arg(top_delay.clone());
 
-        #[cfg(target_os = "linux")]
-        let dump_pid = pid.clone().required_unless_present("core");
-
-        #[cfg(not(target_os = "linux"))]
-        let dump_pid = pid.clone().required(true);
-
         let dump = Command::new("dump")
-            .about("Dumps stack traces for a target program to stdout")
-            .arg(dump_pid);
-
-        #[cfg(target_os = "linux")]
-        let dump = dump.arg(
-            Arg::new("core")
-                .short('c')
-                .long("core")
-                .help("Filename of coredump to display python stack traces from")
-                .value_name("core")
-                .action(ArgAction::Set),
-        );
-
-        let dump = dump.arg(full_filenames.clone())
-            .arg(Arg::new("locals")
-                .short('l')
-                .long("locals")
-                .action(ArgAction::Count)
-                .help("Show local variables for each frame. Passing multiple times (-ll) increases verbosity"))
-            .arg(Arg::new("json")
-                .short('j')
-                .long("json")
-                .help("Format output as JSON")
-                .action(ArgAction::SetTrue))
+            .about("Dump stack traces for a target VM to stdout")
+            .arg(pid.clone().required(true))
+            .arg(full_filenames.clone())
+            .arg(
+                Arg::new("json")
+                    .short('j')
+                    .long("json")
+                    .help("Format output as JSON")
+                    .action(ArgAction::SetTrue),
+            )
             .arg(subprocesses.clone());
 
         let completions = Command::new("completions")
@@ -342,11 +273,6 @@ impl Config {
                     .action(ArgAction::Set),
             );
 
-        let record = record.arg(native.clone());
-        let top = top.arg(native.clone());
-        let dump = dump.arg(native.clone());
-
-        // Nonblocking isn't an option for freebsd, remove
         #[cfg(not(target_os = "freebsd"))]
         let record = record.arg(nonblocking.clone());
         #[cfg(not(target_os = "freebsd"))]
@@ -375,16 +301,7 @@ impl Config {
         debug!("Command line args: {:?}", matches);
 
         let mut config = Config::default();
-
         let (subcommand, matches) = matches.subcommand().unwrap();
-
-        // Check if `--native` was used on an unsupported platform
-        if subcommand != "completions" && !cfg!(feature = "unwind") && matches.get_flag("native") {
-            eprintln!(
-                "Collecting stack traces from native extensions (`--native`) is not supported on your platform."
-            );
-            std::process::exit(1);
-        }
 
         match subcommand {
             "record" => {
@@ -398,18 +315,7 @@ impl Config {
                 config.format = matches.get_one("format").copied();
                 config.filename = matches.get_one::<String>("output").cloned();
                 config.show_line_numbers = !matches.get_flag("nolineno");
-                config.lineno = if matches.get_flag("nolineno") {
-                    LineNo::NoLine
-                } else if matches.get_flag("function") {
-                    LineNo::First
-                } else {
-                    LineNo::LastInstruction
-                };
                 config.include_thread_ids = matches.get_flag("threads");
-                if matches.get_flag("nolineno") && matches.get_flag("function") {
-                    eprintln!("--function & --nolinenos can't be used together");
-                    std::process::exit(1);
-                }
                 config.hide_progress = matches.get_flag("hideprogress");
             }
             "top" => {
@@ -418,12 +324,6 @@ impl Config {
             }
             "dump" => {
                 config.dump_json = matches.get_flag("json");
-                config.dump_locals = matches.get_count("locals").into();
-
-                #[cfg(target_os = "linux")]
-                {
-                    config.core_filename = matches.get_one("core").cloned();
-                }
             }
             "completions" => {
                 let shell = matches.get_one::<clap_complete::Shell>("shell").unwrap();
@@ -436,10 +336,9 @@ impl Config {
 
         match subcommand {
             "record" | "top" => {
-                config.python_program = matches
-                    .get_many::<String>("python_program")
+                config.program = matches
+                    .get_many::<String>("program")
                     .map(|vals| vals.map(|v| v.to_owned()).collect());
-                config.gil_only = matches.get_flag("gil");
                 config.include_idle = matches.get_flag("idle");
             }
             _ => {}
@@ -448,61 +347,37 @@ impl Config {
         config.subprocesses = matches.get_flag("subprocesses");
         config.command = subcommand.to_owned();
 
-        // options that can be shared between subcommands
-        config.pid = matches.get_one::<String>("pid").map(|p| {
-            // allow pid to be specified as a hexadecimal value
-            match p.to_lowercase().strip_prefix("0x") {
-                Some(prefix) => Pid::from_str_radix(prefix, 16).expect("invalid pid"),
-                None => p.parse().expect("invalid pid"),
-            }
-        });
+        config.pid =
+            matches
+                .get_one::<String>("pid")
+                .map(|p| match p.to_lowercase().strip_prefix("0x") {
+                    Some(prefix) => Pid::from_str_radix(prefix, 16).expect("invalid pid"),
+                    None => p.parse().expect("invalid pid"),
+                });
 
         config.full_filenames = matches.get_flag("full_filenames");
-        if cfg!(feature = "unwind") {
-            config.native = matches.get_flag("native");
-        }
-
         config.capture_output = config.command != "record" || matches.get_flag("capture");
         if !config.capture_output {
             config.hide_progress = true;
         }
 
+        #[cfg(not(target_os = "freebsd"))]
         if matches.get_flag("nonblocking") {
-            // disable native profiling if invalidly asked for
-            if config.native {
-                eprintln!("Can't get native stack traces with the --nonblocking option.");
-                std::process::exit(1);
-            }
-            config.blocking = LockingStrategy::NonBlocking;
-        }
-
-        #[cfg(windows)]
-        {
-            if config.native && config.subprocesses {
-                // the native extension profiling code relies on dbghelp library, which doesn't
-                // seem to work when connecting to multiple processes. disallow
-                eprintln!(
-                    "Can't get native stack traces with the ---subprocesses option on windows."
-                );
-                std::process::exit(1);
-            }
+            eprintln!("st-spy requires process suspension to unwind OpenSmalltalk VM stacks.");
+            std::process::exit(1);
         }
 
         #[cfg(target_os = "freebsd")]
         {
-            if config.pid.is_some() {
-                if std::env::var("PYSPY_ALLOW_FREEBSD_ATTACH").is_err() {
-                    eprintln!("On FreeBSD, running py-spy can cause an exception in the profiled process if the process \
-                        is calling 'socket.connect'.");
-                    eprintln!("While this is fixed in recent versions of python, you need to acknowledge the risk here by \
-                        setting an environment variable PYSPY_ALLOW_FREEBSD_ATTACH to run this command.");
-                    eprintln!(
-                        "\nSee https://github.com/benfred/py-spy/issues/147 for more information"
-                    );
-                    std::process::exit(-1);
-                }
+            if config.pid.is_some() && std::env::var("STSPY_ALLOW_FREEBSD_ATTACH").is_err() {
+                eprintln!("On FreeBSD, attaching to a running VM can disrupt the target process.");
+                eprintln!(
+                    "Set STSPY_ALLOW_FREEBSD_ATTACH=1 to acknowledge that risk and continue."
+                );
+                std::process::exit(-1);
             }
         }
+
         info!("config {:#?}", config);
         Ok(config)
     }
@@ -512,93 +387,81 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn get_config(cmd: &str) -> clap::error::Result<Config> {
         #[cfg(target_os = "freebsd")]
-        std::env::set_var("PYSPY_ALLOW_FREEBSD_ATTACH", "1");
+        std::env::set_var("STSPY_ALLOW_FREEBSD_ATTACH", "1");
         let args: Vec<String> = cmd.split_whitespace().map(|x| x.to_owned()).collect();
         Config::from_args(&args)
     }
 
     #[test]
     fn test_parse_record_args() {
-        // basic use case
-        let config = get_config("py-spy record --pid 1234 --output foo").unwrap();
+        let config = get_config("st-spy record --pid 1234 --output foo").unwrap();
         assert_eq!(config.pid, Some(1234));
         assert_eq!(config.filename, Some(String::from("foo")));
         assert_eq!(config.format, Some(FileFormat::flamegraph));
         assert_eq!(config.command, String::from("record"));
 
-        // same command using short versions of everything
-        let short_config = get_config("py-spy r -p 1234 -o foo").unwrap();
+        let short_config = get_config("st-spy r -p 1234 -o foo").unwrap();
         assert_eq!(config, short_config);
 
-        // missing the --pid argument should fail
         assert_eq!(
-            get_config("py-spy record -o foo").unwrap_err().kind(),
+            get_config("st-spy record -o foo").unwrap_err().kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
 
-        // but should work when passed a python program
-        let program_config = get_config("py-spy r -o foo -- python test.py").unwrap();
+        let program_config = get_config("st-spy r -o foo -- squeak Squeak.image").unwrap();
         assert_eq!(
-            program_config.python_program,
-            Some(vec![String::from("python"), String::from("test.py")])
+            program_config.program,
+            Some(vec![String::from("squeak"), String::from("Squeak.image")])
         );
         assert_eq!(program_config.pid, None);
 
-        // passing an invalid file format should fail
         assert_eq!(
-            get_config("py-spy r -p 1234 -o foo -f unknown")
+            get_config("st-spy r -p 1234 -o foo -f unknown")
                 .unwrap_err()
                 .kind(),
             clap::error::ErrorKind::InvalidValue
         );
 
-        // test out overriding these params by setting flags
-        assert_eq!(config.include_idle, false);
-        assert_eq!(config.gil_only, false);
-        assert_eq!(config.include_thread_ids, false);
+        assert!(!config.include_idle);
+        assert!(!config.include_thread_ids);
 
-        let config_flags = get_config("py-spy r -p 1234 -o foo --idle --gil --threads").unwrap();
-        assert_eq!(config_flags.include_idle, true);
-        assert_eq!(config_flags.gil_only, true);
-        assert_eq!(config_flags.include_thread_ids, true);
+        let config_flags = get_config("st-spy r -p 1234 -o foo --idle --threads").unwrap();
+        assert!(config_flags.include_idle);
+        assert!(config_flags.include_thread_ids);
     }
 
     #[test]
     fn test_parse_dump_args() {
-        // basic use case
-        let config = get_config("py-spy dump --pid 1234").unwrap();
+        let config = get_config("st-spy dump --pid 1234").unwrap();
         assert_eq!(config.pid, Some(1234));
         assert_eq!(config.command, String::from("dump"));
 
-        // short version
-        let short_config = get_config("py-spy d -p 1234").unwrap();
+        let short_config = get_config("st-spy d -p 1234").unwrap();
         assert_eq!(config, short_config);
 
-        // missing the --pid argument should fail
         assert_eq!(
-            get_config("py-spy dump").unwrap_err().kind(),
+            get_config("st-spy dump").unwrap_err().kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 
     #[test]
     fn test_parse_top_args() {
-        // basic use case
-        let config = get_config("py-spy top --pid 1234").unwrap();
+        let config = get_config("st-spy top --pid 1234").unwrap();
         assert_eq!(config.pid, Some(1234));
         assert_eq!(config.command, String::from("top"));
 
-        // short version
-        let short_config = get_config("py-spy t -p 1234").unwrap();
+        let short_config = get_config("st-spy t -p 1234").unwrap();
         assert_eq!(config, short_config);
     }
 
     #[test]
     fn test_parse_args() {
         assert_eq!(
-            get_config("py-spy dude").unwrap_err().kind(),
+            get_config("st-spy dude").unwrap_err().kind(),
             clap::error::ErrorKind::InvalidSubcommand
         );
     }

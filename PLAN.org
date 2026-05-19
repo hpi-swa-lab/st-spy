@@ -1,0 +1,49 @@
+* st-spy plan
+
+** Current status
+- Cargo package and binary are named =st-spy=.
+- The profiler targets OpenSmalltalk/Squeak VM processes.
+- =SmalltalkProcessInfo= identifies likely VM processes from executable names and VM symbols.
+- =SmalltalkSpy= samples all OS threads with native unwinding.
+- =SmalltalkSymbolizer= resolves Cog JIT PCs through the method zone and emits class-qualified Smalltalk names when method metadata can be decoded.
+- Non-method generated code is grouped as =JIT frame= or named Cog trampoline frames.
+- CLI output supports =top=, =dump=, =record=, flamegraph, speedscope, raw folded stacks, and chrome trace.
+
+** Local VM bundle
+- Scratch VM/image assets live under ignored =.st-spy-work/squeak=.
+- Repeatable bundle source:
+  =https://files.squeak.org/6.0/Squeak6.0-22148-64bit/Squeak6.0-22148-64bit-All-in-One.zip=
+- Launcher:
+  =.st-spy-work/squeak/squeak.sh=
+- Image:
+  =.st-spy-work/squeak/Squeak6.0-22148-64bit-All-in-One.app/Contents/Resources/Squeak6.0-22148-64bit.image=
+
+** Symbolization notes
+- The Squeak 6.0 VM exposes the method-zone globals =baseAddress= and =mzFreeStart=.
+- Cog methods are walked forward by =roundUpToMethodAlignment(blockSize)=.
+- 64-bit Spur CogMethod fields used:
+  - =blockSize= at offset =0x0c=
+  - =methodObject= at offset =0x10=
+  - =methodHeader= at offset =0x18=
+  - =selector= at offset =0x20=
+- Method frames prefer =Class>>selector=.
+- PIC/send-cache frames are labelled =JIT PIC>>selector= or =JIT closed PIC>>selector= because they are send-site caches rather than receiver methods.
+
+** Validation commands
+- Use =CARGO_HOME=/tmp/st-spy-cargo= in this workspace because the default registry cache is read-only.
+- Format and test:
+  =CARGO_HOME=/tmp/st-spy-cargo cargo fmt=
+  =CARGO_HOME=/tmp/st-spy-cargo cargo test --offline=
+- Release build:
+  =CARGO_HOME=/tmp/st-spy-cargo cargo build --release --offline=
+- FFI plugin workload profile:
+  =CARGO_HOME=/tmp/st-spy-cargo target/release/st-spy record --duration 15 --rate 200 --output squeak-ffi-named.svg -- .st-spy-work/squeak/squeak.sh -headless -nosound .st-spy-work/squeak/Squeak6.0-22148-64bit-All-in-One.app/Contents/Resources/Squeak6.0-22148-64bit.image examples/ffi-plugin-workload.st=
+- Build the deep-native scratch plugin:
+  =gcc -shared -fPIC -g -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls -Wl,-soname,STSpyDeepNativePlugin.so -o .st-spy-work/squeak/Squeak6.0-22148-64bit-All-in-One.app/Contents/Linux-x86_64/lib/squeak/5.0-202312181441-64bit/STSpyDeepNativePlugin.so examples/deep-native-plugin.c=
+- Deep-native workload profile:
+  =CARGO_HOME=/tmp/st-spy-cargo target/release/st-spy record --duration 8 --rate 300 --output squeak-deep-native.svg -- .st-spy-work/squeak/squeak.sh -headless -nosound .st-spy-work/squeak/Squeak6.0-22148-64bit-All-in-One.app/Contents/Resources/Squeak6.0-22148-64bit.image examples/deep-native-plugin-workload.st=
+
+** Known limits
+- Class-name recovery is heuristic and depends on Spur object layout and method literals.
+- Attach-mode profiling can be blocked by host =ptrace= settings; launch-mode profiling avoids that in most local tests.
+- The image-side high-level FFI package is not required for the current examples; the deep-native workload uses the VM external primitive/plugin path.

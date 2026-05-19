@@ -7,26 +7,18 @@ mod binary_parser;
 mod chrometrace;
 mod config;
 mod console_viewer;
-#[cfg(target_os = "linux")]
-mod coredump;
-#[cfg(feature = "unwind")]
-mod cython;
 mod dump;
 mod flamegraph;
 #[cfg(feature = "unwind")]
 mod native_stack_trace;
-mod python_bindings;
-mod python_data_access;
-mod python_interpreters;
-mod python_process_info;
-mod python_spy;
-mod python_threading;
 mod sampler;
+mod smalltalk_process_info;
+mod smalltalk_spy;
+mod smalltalk_symbolizer;
 mod speedscope;
 mod stack_trace;
 mod timer;
 mod utils;
-mod version;
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,7 +148,7 @@ fn record_samples(pid: remoteprocess::Pid, config: &Config) -> Result<(), Error>
                 None => return Err(format_err!("A file format is required to record samples")),
             };
             let local_time = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-            let name = match config.python_program.as_ref() {
+            let name = match config.program.as_ref() {
                 Some(prog) => prog[0].to_string(),
                 None => match config.pid.as_ref() {
                     Some(pid) => pid.to_string(),
@@ -173,7 +165,7 @@ fn record_samples(pid: remoteprocess::Pid, config: &Config) -> Result<(), Error>
     // are displaying its stderr/stdout. In that case add a prefix to our println messages so
     // that we can distinguish
     let lede = if config.hide_progress {
-        format!("{}{} ", style("py-spy").bold().green(), style(">").dim())
+        format!("{}{} ", style("st-spy").bold().green(), style(">").dim())
     } else {
         "".to_owned()
     };
@@ -266,10 +258,6 @@ fn record_samples(pid: remoteprocess::Pid, config: &Config) -> Result<(), Error>
                 continue;
             }
 
-            if config.gil_only && !trace.owns_gil {
-                continue;
-            }
-
             if config.include_thread_ids {
                 let threadid = trace.format_threadid();
                 let thread_fmt = if let Some(thread_name) = &trace.thread_name {
@@ -283,9 +271,6 @@ fn record_samples(pid: remoteprocess::Pid, config: &Config) -> Result<(), Error>
                     module: None,
                     short_filename: None,
                     line: 0,
-                    locals: None,
-                    is_entry: true,
-                    is_shim_entry: true,
                 });
             }
 
@@ -385,7 +370,7 @@ fn run_spy_command(pid: remoteprocess::Pid, config: &config::Config) -> Result<(
     Ok(())
 }
 
-fn pyspy_main() -> Result<(), Error> {
+fn stspy_main() -> Result<(), Error> {
     let config = config::Config::from_commandline();
 
     #[cfg(target_os = "macos")]
@@ -397,30 +382,21 @@ fn pyspy_main() -> Result<(), Error> {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(ref core_filename) = config.core_filename {
-            let core = coredump::PythonCoreDump::new(std::path::Path::new(&core_filename))?;
-            let traces = core.get_stack(&config)?;
-            return core.print_traces(&traces, &config);
-        }
-    }
-
     if let Some(pid) = config.pid {
         run_spy_command(pid, &config)?;
-    } else if let Some(ref subprocess) = config.python_program {
+    } else if let Some(ref subprocess) = config.program {
         // Dump out stdout/stderr from the process to a temp file, so we can view it later if needed
         let mut process_output = tempfile::NamedTempFile::new()?;
 
         let mut command = std::process::Command::new(&subprocess[0]);
         #[cfg(unix)]
         {
-            // Drop root permissions if possible: https://github.com/benfred/py-spy/issues/116
+            // Drop root permissions for the profiled command when launched through sudo.
             if unsafe { libc::geteuid() } == 0 {
                 if let Ok(sudo_uid) = std::env::var("SUDO_UID") {
                     use std::os::unix::process::CommandExt;
                     info!(
-                        "Dropping root and running python command as {}",
+                        "Dropping root and running target command as {}",
                         std::env::var("SUDO_USER")?
                     );
                     command.uid(sudo_uid.parse::<u32>()?);
@@ -443,7 +419,6 @@ fn pyspy_main() -> Result<(), Error> {
 
         #[cfg(target_os = "macos")]
         {
-            // sleep just in case: https://jvns.ca/blog/2018/01/28/mac-freeze/
             std::thread::sleep(Duration::from_millis(50));
         }
         let result = run_spy_command(command.id() as _, &config);
@@ -482,7 +457,7 @@ fn main() {
         .try_init()
         .unwrap();
 
-    if let Err(err) = pyspy_main() {
+    if let Err(err) = stspy_main() {
         #[cfg(unix)]
         {
             if permission_denied(&err) {
@@ -500,9 +475,7 @@ fn main() {
                     if cgroups.contains("/docker/") {
                         eprintln!("Permission Denied");
                         eprintln!("\nIt looks like you are running in a docker container. Please make sure \
-                        you started your container with the SYS_PTRACE capability. See \
-                        https://github.com/benfred/py-spy#how-do-i-run-py-spy-in-docker for \
-                        more details");
+                        you started your container with the SYS_PTRACE capability.");
                         std::process::exit(1);
                     }
                 }

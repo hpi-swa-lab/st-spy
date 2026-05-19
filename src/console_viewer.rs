@@ -10,12 +10,11 @@ use console::{style, Term};
 
 use crate::config::Config;
 use crate::stack_trace::{Frame, StackTrace};
-use crate::version::Version;
 
 pub struct ConsoleViewer {
     #[allow(dead_code)]
     console_config: os_impl::ConsoleConfig,
-    version: Option<Version>,
+    version: Option<String>,
     command: String,
     sampling_rate: f64,
     running: Arc<atomic::AtomicBool>,
@@ -28,8 +27,8 @@ pub struct ConsoleViewer {
 impl ConsoleViewer {
     pub fn new(
         show_linenumbers: bool,
-        python_command: &str,
-        version: &Option<Version>,
+        command: &str,
+        version: &Option<String>,
         config: &Config,
     ) -> io::Result<ConsoleViewer> {
         let sampling_rate = 1.0 / (config.sampling_rate as f64);
@@ -70,7 +69,7 @@ impl ConsoleViewer {
         Ok(ConsoleViewer {
             console_config: os_impl::ConsoleConfig::new()?,
             version: version.clone(),
-            command: python_command.to_owned(),
+            command: command.to_owned(),
             running,
             options,
             sampling_rate,
@@ -94,14 +93,6 @@ impl ConsoleViewer {
 
             if !(self.config.include_idle || trace.active) {
                 continue;
-            }
-
-            if self.config.gil_only && !trace.owns_gil {
-                continue;
-            }
-
-            if trace.owns_gil {
-                self.stats.gil += 1
             }
 
             if trace.active {
@@ -189,7 +180,7 @@ impl ConsoleViewer {
             );
         } else {
             out!(
-                "Collecting samples from '{}' (python v{})",
+                "Collecting samples from '{}' ({})",
                 style(&self.command).green(),
                 self.version.as_ref().unwrap()
             );
@@ -209,8 +200,7 @@ impl ConsoleViewer {
         }
 
         out!(
-            "GIL: {:.2}%, Active: {:>.2}%, Threads: {}{}",
-            style(100.0 * self.stats.gil as f64 / self.stats.current_samples as f64).bold(),
+            "Active: {:>.2}%, Threads: {}{}",
             style(100.0 * self.stats.active as f64 / self.stats.current_samples as f64).bold(),
             style(self.stats.threads).bold(),
             if self.subprocesses {
@@ -314,7 +304,7 @@ impl ConsoleViewer {
             out!("{:^12}{:<}", "R,r", "Reset statistics");
             out!("{:^12}{:<}", "X,x", "Exit this help screen");
             out!();
-            //println!("{:^12}{:<}", "Control-C", "Quit py-spy");
+            //println!("{:^12}{:<}", "Control-C", "Quit st-spy");
         } else {
             out!(
                 "Press {} to quit, or {} for help.",
@@ -435,7 +425,6 @@ struct Stats {
     threads: u64,
     processes: u64,
     active: u64,
-    gil: u64,
     function_counts: HashMap<String, FunctionStatistics>,
     line_counts: HashMap<String, FunctionStatistics>,
     last_error: Option<String>,
@@ -465,7 +454,6 @@ impl Stats {
             late_samples: 0,
             threads: 0,
             processes: 0,
-            gil: 0,
             active: 0,
             line_counts: HashMap::new(),
             function_counts: HashMap::new(),
@@ -485,7 +473,6 @@ impl Stats {
             val.current_total = 0;
             val.current_own = 0;
         }
-        self.gil = 0;
         self.active = 0;
         self.current_samples = 0;
         self.elapsed = 0.;

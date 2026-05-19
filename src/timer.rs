@@ -9,7 +9,8 @@ use rand_distr::Exp;
 /// so that we can sample the process a certain number of times a second.
 /// We're using an irregular sampling strategy to avoid aliasing effects that can happen
 /// if the target process runs code at a similar schedule as the profiler:
-/// https://github.com/benfred/py-spy/issues/94
+/// Keep the observed sample interval close to the requested rate by compensating
+/// for time spent collecting the previous sample.
 pub struct Timer {
     start: Instant,
     desired: Duration,

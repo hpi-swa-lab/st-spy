@@ -54,7 +54,7 @@ impl Chrometrace {
             tid: trace.thread_id,
             pid: trace.pid as u64,
             name: frame.name.to_string(),
-            cat: "py-spy".to_owned(),
+            cat: "st-spy".to_owned(),
             ph: phase.to_owned(),
             ts,
             args: Args {

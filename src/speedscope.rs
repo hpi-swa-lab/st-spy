@@ -148,7 +148,7 @@ impl SpeedscopeFile {
                     profile_type: ProfileType::Sampled,
                     name: thread_name_map
                         .get(thread_id)
-                        .map_or_else(|| "py-spy".to_string(), |x| x.clone()),
+                        .map_or_else(|| "st-spy".to_string(), |x| x.clone()),
                     unit: ValueUnit::Seconds,
                     start_value: 0.0,
                     end_value: scaled_end_value,
@@ -164,8 +164,8 @@ impl SpeedscopeFile {
             // This is always the same
             schema: "https://www.speedscope.app/file-format-schema.json".to_string(),
             active_profile_index: None,
-            name: Some("py-spy profile".to_string()),
-            exporter: Some(format!("py-spy@{}", env!("CARGO_PKG_VERSION"))),
+            name: Some("st-spy profile".to_string()),
+            exporter: Some(format!("st-spy@{}", env!("CARGO_PKG_VERSION"))),
             profiles,
             shared: Shared {
                 frames: frames.to_owned(),
@@ -283,13 +283,10 @@ mod tests {
 
         let frame = stack_trace::Frame {
             name: String::from("test"),
-            filename: String::from("test.py"),
+            filename: String::from("test.st"),
             module: None,
             short_filename: None,
             line: 0,
-            locals: None,
-            is_entry: true,
-            is_shim_entry: false,
         };
 
         let trace = stack_trace::StackTrace {
@@ -298,7 +295,6 @@ mod tests {
             thread_name: None,
             os_thread_id: None,
             active: true,
-            owns_gil: false,
             frames: vec![frame],
             process_info: None,
         };

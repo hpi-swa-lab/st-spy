@@ -4,7 +4,7 @@ use anyhow::{Context, Error};
 use console::{style, Term};
 
 use crate::config::Config;
-use crate::python_spy::PythonSpy;
+use crate::smalltalk_spy::SmalltalkSpy;
 use crate::stack_trace::StackTrace;
 
 use remoteprocess::Pid;
@@ -21,7 +21,7 @@ pub fn write_traces<W: Write>(
     config: &Config,
     parent: Option<Pid>,
 ) -> Result<(), Error> {
-    let mut process = PythonSpy::new(pid, config)?;
+    let mut process = SmalltalkSpy::new(pid, config)?;
     if config.dump_json {
         let traces = process
             .get_stack_traces()
@@ -39,8 +39,8 @@ pub fn write_traces<W: Write>(
 
     writeln!(
         out,
-        "Python v{} ({})",
-        style(&process.version).bold(),
+        "OpenSmalltalk VM {} ({})",
+        style(&process.vm_version).bold(),
         style(process.process.exe()?).dim()
     )?;
 
@@ -83,6 +83,7 @@ pub fn write_traces<W: Write>(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn print_trace(trace: &StackTrace, include_activity: bool) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -99,8 +100,6 @@ pub fn write_trace<W: Write>(
 
     let status = if include_activity {
         format!(" ({})", trace.status_str())
-    } else if trace.owns_gil {
-        " (gil)".to_owned()
     } else {
         "".to_owned()
     };
@@ -140,23 +139,6 @@ pub fn write_trace<W: Write>(
                 style(&frame.name).green(),
                 style(&filename).cyan()
             )?;
-        }
-
-        if let Some(locals) = &frame.locals {
-            let mut shown_args = false;
-            let mut shown_locals = false;
-            for local in locals {
-                if local.arg && !shown_args {
-                    writeln!(out, "        {}", style("Arguments:").dim())?;
-                    shown_args = true;
-                } else if !local.arg && !shown_locals {
-                    writeln!(out, "        {}", style("Locals:").dim())?;
-                    shown_locals = true;
-                }
-
-                let repr = local.repr.as_deref().unwrap_or("?");
-                writeln!(out, "            {}: {}", local.name, repr)?;
-            }
         }
     }
     Ok(())

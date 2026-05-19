@@ -11,13 +11,12 @@ use anyhow::Error;
 use remoteprocess::Pid;
 
 use crate::config::Config;
-use crate::python_spy::PythonSpy;
+use crate::smalltalk_spy::SmalltalkSpy;
 use crate::stack_trace::{ProcessInfo, StackTrace};
 use crate::timer::Timer;
-use crate::version::Version;
 
 pub struct Sampler {
-    pub version: Option<Version>,
+    pub version: Option<String>,
     rx: Option<Receiver<Sample>>,
     sampling_thread: Option<thread::JoinHandle<()>>,
 }
@@ -41,16 +40,16 @@ impl Sampler {
     fn new_sampler(pid: Pid, config: &Config) -> Result<Sampler, Error> {
         let (tx, rx): (Sender<Sample>, Receiver<Sample>) = mpsc::channel();
         let (initialized_tx, initialized_rx): (
-            Sender<Result<Version, Error>>,
-            Receiver<Result<Version, Error>>,
+            Sender<Result<String, Error>>,
+            Receiver<Result<String, Error>>,
         ) = mpsc::channel();
         let config = config.clone();
         let sampling_thread = thread::spawn(move || {
-            // We need to create this object inside the thread here since PythonSpy objects don't
+            // We need to create this object inside the thread here since remote process handles don't
             // have the Send trait implemented on linux
-            let mut spy = match PythonSpy::retry_new(pid, &config, 20) {
+            let mut spy = match SmalltalkSpy::retry_new(pid, &config, 20) {
                 Ok(spy) => {
-                    if initialized_tx.send(Ok(spy.version.clone())).is_err() {
+                    if initialized_tx.send(Ok(spy.vm_version.clone())).is_err() {
                         return;
                     }
                     spy
@@ -100,21 +99,21 @@ impl Sampler {
         })
     }
 
-    /// Creates a new sampler object that samples any python process in the
+    /// Creates a new sampler object that samples any OpenSmalltalk process in the
     /// process or child processes
     fn new_subprocess_sampler(pid: Pid, config: &Config) -> Result<Sampler, Error> {
         let process = remoteprocess::Process::new(pid)?;
 
-        // Initialize a PythonSpy object per child, and build up the process tree
+        // Initialize a SmalltalkSpy object per child, and build up the process tree
         let mut spies = HashMap::new();
         let mut retries = 10;
-        spies.insert(pid, PythonSpyThread::new(pid, None, config)?);
+        spies.insert(pid, SmalltalkSpyThread::new(pid, None, config)?);
 
         loop {
             for (childpid, parentpid) in process.child_processes()? {
                 // If we can't create the child process, don't worry about it
                 // can happen with zombie child processes etc
-                match PythonSpyThread::new(childpid, Some(parentpid), config) {
+                match SmalltalkSpyThread::new(childpid, Some(parentpid), config) {
                     Ok(spy) => {
                         spies.insert(childpid, spy);
                     }
@@ -124,8 +123,7 @@ impl Sampler {
                 }
             }
 
-            // wait for all the various python spy objects to initialize, and break out of here
-            // if we have one of them started.
+            // Wait for one of the VM profilers to initialize before sampling.
             if spies.values_mut().any(|spy| spy.wait_initialized()) {
                 break;
             }
@@ -134,7 +132,7 @@ impl Sampler {
             retries -= 1;
             if retries == 0 {
                 return Err(format_err!(
-                    "No python processes found in process {} or any of its subprocesses",
+                    "No OpenSmalltalk VM processes found in process {} or any of its subprocesses",
                     pid
                 ));
             }
@@ -157,7 +155,11 @@ impl Sampler {
                             if spies.contains_key(&childpid) {
                                 continue;
                             }
-                            match PythonSpyThread::new(childpid, Some(parentpid), &monitor_config) {
+                            match SmalltalkSpyThread::new(
+                                childpid,
+                                Some(parentpid),
+                                &monitor_config,
+                            ) {
                                 Ok(spy) => {
                                     spies.insert(childpid, spy);
                                 }
@@ -200,7 +202,7 @@ impl Sampler {
                     }
                 }
 
-                // collect the traces from each python spy if possible
+                // collect the traces from each Smalltalk spy if possible
                 for spy in spies.values_mut() {
                     match spy.collect() {
                         Some(Ok(mut t)) => traces.append(&mut t),
@@ -266,11 +268,11 @@ impl Drop for Sampler {
     }
 }
 
-struct PythonSpyThread {
-    initialized_rx: Receiver<Result<Version, Error>>,
+struct SmalltalkSpyThread {
+    initialized_rx: Receiver<Result<String, Error>>,
     notify_tx: Sender<()>,
     sample_rx: Receiver<Result<Vec<StackTrace>, Error>>,
-    initialized: Option<Result<Version, Error>>,
+    initialized: Option<Result<String, Error>>,
     pub running: bool,
     notified: bool,
     pub process: remoteprocess::Process,
@@ -278,11 +280,11 @@ struct PythonSpyThread {
     pub command_line: String,
 }
 
-impl PythonSpyThread {
-    fn new(pid: Pid, parent: Option<Pid>, config: &Config) -> Result<PythonSpyThread, Error> {
+impl SmalltalkSpyThread {
+    fn new(pid: Pid, parent: Option<Pid>, config: &Config) -> Result<SmalltalkSpyThread, Error> {
         let (initialized_tx, initialized_rx): (
-            Sender<Result<Version, Error>>,
-            Receiver<Result<Version, Error>>,
+            Sender<Result<String, Error>>,
+            Receiver<Result<String, Error>>,
         ) = mpsc::channel();
         let (notify_tx, notify_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
         let (sample_tx, sample_rx): (
@@ -297,17 +299,20 @@ impl PythonSpyThread {
             .unwrap_or_else(|_| "".to_owned());
 
         thread::spawn(move || {
-            // We need to create this object inside the thread here since PythonSpy objects don't
+            // We need to create this object inside the thread here since remote process handles don't
             // have the Send trait implemented on linux
-            let mut spy = match PythonSpy::retry_new(pid, &config, 5) {
+            let mut spy = match SmalltalkSpy::retry_new(pid, &config, 5) {
                 Ok(spy) => {
-                    if initialized_tx.send(Ok(spy.version.clone())).is_err() {
+                    if initialized_tx.send(Ok(spy.vm_version.clone())).is_err() {
                         return;
                     }
                     spy
                 }
                 Err(e) => {
-                    warn!("Failed to profile python from process {}: {}", pid, e);
+                    warn!(
+                        "Failed to profile OpenSmalltalk VM from process {}: {}",
+                        pid, e
+                    );
                     initialized_tx.send(Err(e)).unwrap();
                     return;
                 }
@@ -327,7 +332,7 @@ impl PythonSpyThread {
                 }
             }
         });
-        Ok(PythonSpyThread {
+        Ok(SmalltalkSpyThread {
             initialized_rx,
             notify_tx,
             sample_rx,
@@ -350,7 +355,7 @@ impl PythonSpyThread {
             Err(e) => {
                 // shouldn't happen, but will be ok if it does
                 warn!(
-                    "Failed to get initialization status from PythonSpyThread: {}",
+                    "Failed to get initialization status from SmalltalkSpyThread: {}",
                     e
                 );
                 false
@@ -371,7 +376,7 @@ impl PythonSpyThread {
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 // this *shouldn't* happen
-                warn!("Failed to get initialization status from PythonSpyThread: disconnected");
+                warn!("Failed to get initialization status from SmalltalkSpyThread: disconnected");
                 false
             }
         }
@@ -403,7 +408,10 @@ impl PythonSpyThread {
     }
 }
 
-fn get_process_info(pid: Pid, spies: &HashMap<Pid, PythonSpyThread>) -> Option<Box<ProcessInfo>> {
+fn get_process_info(
+    pid: Pid,
+    spies: &HashMap<Pid, SmalltalkSpyThread>,
+) -> Option<Box<ProcessInfo>> {
     spies.get(&pid).map(|spy| {
         let parent = spy
             .parent
