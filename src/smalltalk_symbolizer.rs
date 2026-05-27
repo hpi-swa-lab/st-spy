@@ -47,6 +47,15 @@ struct MethodZoneSymbols {
     free_start_addr: u64,
 }
 
+/// Addresses of VM globals needed to walk the Cog frame chain.
+#[derive(Clone, Copy)]
+struct CogFrameSymbols {
+    frame_pointer_addr: u64,
+    heap_base_addr: u64,
+}
+
+const COG_FRAME_WALK_LIMIT: usize = 200;
+
 #[derive(Clone)]
 struct JitEntrySymbolSlot {
     slot_addr: u64,
@@ -77,6 +86,7 @@ pub struct SmalltalkSymbolizer {
     method_zone_blocked_cursor: Option<u64>,
     jit_entry_symbol_slots: Vec<JitEntrySymbolSlot>,
     jit_entry_symbols: Vec<JitEntrySymbol>,
+    cog_frame_symbols: Option<CogFrameSymbols>,
 }
 
 impl SmalltalkSymbolizer {
@@ -120,6 +130,22 @@ impl SmalltalkSymbolizer {
         } else {
             debug!("OpenSmalltalk Cog method-zone symbols were not found");
         }
+        let cog_frame_symbols = binary.and_then(|binary| {
+            let frame_pointer_addr = binary.symbols.get("framePointer")?;
+            let heap_base_addr = binary.symbols.get("heapBase")?;
+            Some(CogFrameSymbols {
+                frame_pointer_addr: *frame_pointer_addr,
+                heap_base_addr: *heap_base_addr,
+            })
+        });
+        if let Some(symbols) = cog_frame_symbols {
+            debug!(
+                "OpenSmalltalk Cog frame symbols: framePointer @ 0x{:x}, heapBase @ 0x{:x}",
+                symbols.frame_pointer_addr, symbols.heap_base_addr
+            );
+        } else {
+            debug!("OpenSmalltalk Cog frame symbols were not found");
+        }
         let process = remoteprocess::Process::new(pid)
             .expect("SmalltalkSymbolizer requires an already-open process");
 
@@ -134,6 +160,7 @@ impl SmalltalkSymbolizer {
             method_zone_blocked_cursor: None,
             jit_entry_symbol_slots,
             jit_entry_symbols: Vec::new(),
+            cog_frame_symbols,
         }
     }
 
@@ -174,6 +201,124 @@ impl SmalltalkSymbolizer {
             .or_else(|| self.generic_cog_code_name(pc));
         self.resolved_pcs.insert(pc, resolved.clone());
         resolved
+    }
+
+    /// Walk the Cog internal frame chain starting from the VM's current `framePointer`.
+    ///
+    /// The Cog frame layout on x86-64 is:
+    ///   FP[0]   = caller/sender FP (next frame up the chain, 0 = end)
+    ///   FP[-8]  = method field:
+    ///               if < heapBase → pointer into the Cog method zone (JIT'd CogMethod)
+    ///               if >= heapBase → a Smalltalk context OOP (interpreted frame)
+    ///
+    /// For JIT frames, FP[-8] points directly at a CogMethod header, and we resolve
+    /// the name via the method zone.  For interpreted frames, FP[-8] is a context
+    /// whose `method` field (slot 3, offset 0x20 from OOP) is the CompiledMethod OOP;
+    /// we read its selector from the literal frame.
+    ///
+    /// Returns frames in caller order (innermost first), suitable for splicing into
+    /// a native stack trace.
+    pub fn walk_cog_frames(&mut self) -> Vec<String> {
+        let Some(symbols) = self.cog_frame_symbols else {
+            return Vec::new();
+        };
+
+        let fp: u64 = match self.process.copy_struct(symbols.frame_pointer_addr as usize) {
+            Ok(fp) => fp,
+            Err(_) => return Vec::new(),
+        };
+        if fp == 0 {
+            return Vec::new();
+        }
+
+        let heap_base: u64 = match self.process.copy_struct(symbols.heap_base_addr as usize) {
+            Ok(hb) => hb,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut frames = Vec::new();
+        let mut current_fp = fp;
+        let mut iterations = 0;
+
+        while current_fp != 0 && iterations < COG_FRAME_WALK_LIMIT {
+            iterations += 1;
+
+            // FP[-8] = method field
+            let method_field: u64 = match self
+                .process
+                .copy_struct((current_fp.wrapping_sub(8)) as usize)
+            {
+                Ok(mf) => mf,
+                Err(_) => break,
+            };
+
+            if let Some(name) = self.resolve_frame_method(method_field, heap_base) {
+                frames.push(name);
+            }
+
+            // FP[0] = caller FP
+            let caller_fp: u64 = match self.process.copy_struct(current_fp as usize) {
+                Ok(cfp) => cfp,
+                Err(_) => break,
+            };
+
+            // Safety: prevent infinite loops
+            if caller_fp == current_fp || caller_fp == 0 {
+                break;
+            }
+            current_fp = caller_fp;
+        }
+
+        frames
+    }
+
+    /// Resolve the method name from a Cog frame's method field.
+    ///
+    /// If the method field points below `heap_base`, it's a CogMethod pointer
+    /// in the method zone — resolve it directly.
+    ///
+    /// If it points at or above `heap_base`, it's a Smalltalk context OOP.
+    /// We read the context's method field (slot 3) and resolve the CompiledMethod.
+    fn resolve_frame_method(&mut self, method_field: u64, heap_base: u64) -> Option<String> {
+        if method_field == 0 {
+            return None;
+        }
+
+        if method_field < heap_base {
+            // JIT frame: method_field is a CogMethod* in the method zone.
+            // The method's executable code starts at CogMethod + COG_METHOD_SIZE.
+            // Use the entry point (just past the header) as the PC for resolution.
+            let pc = method_field + COG_METHOD_SIZE;
+            self.resolve_jit_pc(pc)
+        } else {
+            // Interpreted frame: method_field is a context OOP.
+            // Context layout (Spur, 64-bit):
+            //   slot 0 (oop+8)  = sender
+            //   slot 1 (oop+16) = instructionPointer
+            //   slot 2 (oop+24) = stackPointer
+            //   slot 3 (oop+32) = method
+            //   slot 4 (oop+40) = closureOrNil
+            //   slot 5 (oop+48) = receiver
+            if !is_heap_object(method_field) {
+                return None;
+            }
+            let method_obj: u64 = self
+                .process
+                .copy_struct((method_field + BASE_HEADER_SIZE + 3 * WORD_SIZE as u64) as usize)
+                .ok()?;
+            if !is_heap_object(method_obj) || !self.is_compiled_method(method_obj) {
+                return None;
+            }
+            let method_header = self.method_header_of(method_obj)?;
+            let selector = self
+                .maybe_selector_of_method(method_obj, method_header, 0)
+                .filter(|s| looks_like_selector(s))?;
+            let class_name = self.class_name_of_method(method_obj, method_header, 0);
+            Some(match class_name {
+                Some(cn) => format!("{cn}>>{selector}"),
+                None => format!("???>>{selector}"),
+            })
+        }
     }
 
     fn lookup_method_range(&self, pc: u64) -> Option<String> {
