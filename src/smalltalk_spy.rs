@@ -105,39 +105,66 @@ impl SmalltalkSpy {
 
             // Pass 2: When the native stack shows we're inside a VM
             // primitive/FFI callout, the Smalltalk caller frames are NOT on the
-            // native stack — they live in the Cog internal frame chain.  Detect
+            // native stack -- they live in the Cog internal frame chain.  Detect
             // this boundary and splice in the Cog frames.
             if let Some(splice_pos) = Self::find_interpreter_boundary(&frames) {
                 let cog_frames = self.smalltalk_symbolizer.walk_cog_frames();
                 if !cog_frames.is_empty() {
-                    // Deduplicate: if the innermost Cog frame is already on the
-                    // native stack (resolved as Smalltalk), skip it.
-                    let skip = if let Some(first_cog) = cog_frames.first() {
-                        frames[..splice_pos]
-                            .iter()
-                            .any(|f| f.filename == "Smalltalk" && f.name == *first_cog)
-                    } else {
-                        false
-                    };
+                    // Collect names of Smalltalk frames already on the native
+                    // stack so we can deduplicate.  The native unwinder may
+                    // have caught some JIT frames that are also in the Cog
+                    // chain (e.g. the current method executing a primitive).
+                    let existing_st_names: std::collections::HashSet<String> = frames
+                        .iter()
+                        .filter(|f| f.filename == "Smalltalk"
+                            && !f.name.starts_with("Cog ")
+                            && !f.name.starts_with("JIT "))
+                        .map(|f| f.name.clone())
+                        .collect();
 
-                    let cog_frame_objects: Vec<Frame> = cog_frames
+                    // Remove any native-resolved Smalltalk frames after the
+                    // boundary -- they'll be replaced by the (more complete)
+                    // Cog frame chain.  Keep non-Smalltalk frames (C code,
+                    // trampolines) as they provide useful native context.
+                    let mut trim_end = splice_pos;
+                    while trim_end < frames.len()
+                        && (frames[trim_end].filename == "Smalltalk"
+                            || frames[trim_end].name.starts_with("Cog ")
+                            || frames[trim_end].name.starts_with("JIT "))
+                    {
+                        trim_end += 1;
+                    }
+                    frames.truncate(splice_pos);
+
+                    let st_short = self.shorten_filename("Smalltalk");
+
+                    // Skip Cog frames that the native unwinder already caught
+                    // (they appear before the splice point).
+                    let deduped_frames: Vec<Frame> = cog_frames
                         .into_iter()
-                        .skip(if skip { 1 } else { 0 })
-                        .map(|name| {
-                            let short = self.shorten_filename("Smalltalk");
-                            Frame {
-                                name,
-                                filename: "Smalltalk".to_owned(),
-                                module: Some("Squeak".to_owned()),
-                                short_filename: short,
-                                line: 0,
-                            }
+                        .filter(|name| !existing_st_names.contains(name))
+                        .map(|name| Frame {
+                            name,
+                            filename: "Smalltalk".to_owned(),
+                            module: Some("Squeak".to_owned()),
+                            short_filename: st_short.clone(),
+                            line: 0,
                         })
                         .collect();
 
-                    // Insert after the boundary frame so the trace reads:
-                    //   ... native primitive frames ... | Cog Smalltalk frames ...
-                    frames.splice(splice_pos..splice_pos, cog_frame_objects);
+                    frames.extend(deduped_frames);
+
+                    // Append a synthetic root frame so stitched stacks share
+                    // the same root as stacks captured by the native unwinder
+                    // (which start with Cog ceBaseFrameReturn).  This unifies
+                    // the flamegraph into a single tree.
+                    frames.push(Frame {
+                        name: "Cog ceBaseFrameReturn".to_owned(),
+                        filename: "Smalltalk".to_owned(),
+                        module: Some("Squeak".to_owned()),
+                        short_filename: st_short,
+                        line: 0,
+                    });
                 }
             }
 
