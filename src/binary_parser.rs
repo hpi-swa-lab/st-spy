@@ -94,13 +94,27 @@ pub fn parse_binary(filename: &Path, addr: u64, size: u64) -> Result<BinaryInfo,
                 }
             };
 
+            // Mach-O symbol values (n_value) and section addresses are already
+            // absolute addresses relative to the binary's static link address
+            // (e.g. 0x100000000 for __TEXT on a PIE binary). `offset` here is
+            // the actual runtime load address of the __TEXT segment, so the
+            // real ASLR slide is the difference between the two -- adding
+            // `offset` directly would double-count the static base.
+            let text_vmaddr = mach
+                .segments
+                .iter()
+                .find(|segment| segment.name().is_ok_and(|name| name == "__TEXT"))
+                .map(|segment| segment.vmaddr)
+                .ok_or_else(|| format_err!("Failed to find __TEXT segment in {}", filename.display()))?;
+            let slide = offset.wrapping_sub(text_vmaddr);
+
             let mut bss_addr = 0;
             let mut bss_size = 0;
             for segment in mach.segments.iter() {
                 for (section, _) in &segment.sections()? {
                     let name = section.name()?;
                     if name == "__bss" {
-                        if let Some(addr) = section.addr.checked_add(offset) {
+                        if let Some(addr) = section.addr.checked_add(slide) {
                             if addr.checked_add(section.size).is_some() {
                                 bss_addr = addr;
                                 bss_size = section.size;
@@ -116,7 +130,7 @@ pub fn parse_binary(filename: &Path, addr: u64, size: u64) -> Result<BinaryInfo,
                     // almost every symbol we care about starts with an extra _, remove to normalize
                     // with the entries seen on linux/windows
                     if let Some(stripped_name) = name.strip_prefix('_') {
-                        symbols.insert(stripped_name.to_string(), value.n_value + offset);
+                        symbols.insert(stripped_name.to_string(), value.n_value.wrapping_add(slide));
                     }
                 }
             }

@@ -215,6 +215,13 @@ impl SmalltalkSpy {
     ///   - `ceSend*` / `ceReturn*` (Cog runtime helpers)
     ///   - Cog trampoline frames resolved as "Cog ce*"
     fn find_interpreter_boundary(frames: &[Frame]) -> Option<usize> {
+        // No native frames at all (e.g. platforms without a native unwinder,
+        // such as macOS) -- the entire stack has to come from the Cog frame
+        // chain, so splice at the very start.
+        if frames.is_empty() {
+            return Some(0);
+        }
+
         // The frames already contain some Smalltalk frames from JIT (resolved
         // in pass 1).  If we already have a deep Smalltalk call chain, there
         // is likely no disconnection to fix.  We only splice when we see a
