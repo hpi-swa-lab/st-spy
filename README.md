@@ -11,10 +11,14 @@ Note: `st-spy` is derived from `py-spy` and keeps the MIT license.
 
 - `record`, `top`, and `dump` commands for profiling OpenSmalltalk VM processes.
 - Native frame unwinding for VM, plugin, and libc frames.
+- Low-pause sampling: on Linux x86-64 the VM is suspended only long enough to
+  copy registers and a stack slice; the expensive unwinding and symbolization
+  run after the VM has resumed. See `doc/low-pause-unwinding.md`.
 - Cog method-zone decoding for class-qualified Smalltalk frames such as
   `Integer>>factorial` and `STSpyDeepNativeWorkload class>>deepNativeStack`.
 - Cog trampoline and unresolved generated-code grouping as `Cog ...` or
   `JIT frame` instead of raw machine-code addresses where possible.
+- Auto-detects a running OpenSmalltalk VM when no `--pid` is given.
 - Subprocess profiling for VM launchers that spawn the actual VM process.
 
 ## Build
@@ -35,6 +39,17 @@ st-spy dump --pid 12345
 st-spy record --pid 12345 --output squeak.svg
 ```
 
+If exactly one OpenSmalltalk VM is running, `--pid` can be omitted and st-spy
+attaches to it automatically:
+
+```bash
+st-spy top
+st-spy record --output squeak.svg
+```
+
+If no VM is found, or more than one is running, st-spy reports it and asks you
+to specify `--pid`.
+
 Launch a VM and profile it:
 
 ```bash
@@ -50,10 +65,15 @@ Useful options:
 -t, --threads              Include thread ids in record output
 --full-filenames           Keep full source paths in native frames
 -f, --format <format>      flamegraph, speedscope, raw, or chrometrace
+--unwinder <backend>       Native unwinder: framehop (default, Linux x86-64)
+                           or libunwind (cross-platform fallback / comparison)
 ```
 
 On Linux, attaching to an already-running process is subject to the usual
 `ptrace` restrictions. Launch-mode profiling is often the simplest way to test.
+
+Set `RUST_LOG=info` to log the per-sample pause breakdown and duty cycle
+(how long the VM is suspended per sample). See `doc/low-pause-unwinding.md`.
 
 ## Examples
 

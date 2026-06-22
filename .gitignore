@@ -6,3 +6,5 @@ remoteprocess/target
 .vscode/
 **/.vagrant
 *.log
+
+unknown*.svg

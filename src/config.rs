@@ -45,6 +45,8 @@ pub struct Config {
     pub full_filenames: bool,
     #[doc(hidden)]
     pub refresh_seconds: f64,
+    #[doc(hidden)]
+    pub unwinder: UnwinderKind,
 }
 
 #[allow(non_camel_case_types)]
@@ -78,6 +80,33 @@ pub enum LockingStrategy {
     Lock,
 }
 
+/// Which native-stack unwinder backend to use.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "cli", derive(ValueEnum))]
+pub enum UnwinderKind {
+    /// Pure-Rust framehop, unwinding against a copied stack. Fast; the default
+    /// on Linux x86-64. Not available on other targets.
+    framehop,
+    /// libunwind via remoteprocess. Robust, cross-platform, but slow because it
+    /// reads target memory per frame. Default fallback / comparison backend.
+    libunwind,
+}
+
+impl UnwinderKind {
+    /// Backend used when the user doesn't pass --unwinder.
+    pub fn platform_default() -> UnwinderKind {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            UnwinderKind::framehop
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            UnwinderKind::libunwind
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum RecordDuration {
     Unlimited,
@@ -104,6 +133,7 @@ impl Default for Config {
             subprocesses: false,
             full_filenames: false,
             refresh_seconds: 1.0,
+            unwinder: UnwinderKind::platform_default(),
         }
     }
 }
@@ -153,6 +183,17 @@ impl Config {
             .help("Show full source filenames instead of shortening to the basename")
             .action(ArgAction::SetTrue);
 
+        let unwinder = Arg::new("unwinder")
+            .long("unwinder")
+            .value_name("backend")
+            .help(
+                "Native stack unwinder backend. 'framehop' (default on Linux x86-64) is fast; \
+                 'libunwind' is the robust cross-platform fallback used for comparison.",
+            )
+            .value_parser(EnumValueParser::<UnwinderKind>::new())
+            .ignore_case(true)
+            .action(ArgAction::Set);
+
         let program = Arg::new("program")
             .help("Command line of an OpenSmalltalk VM to run")
             .num_args(1..)
@@ -177,8 +218,9 @@ impl Config {
         let record = Command::new("record")
             .about("Record stack traces to a flamegraph, speedscope, raw, or chrome trace file")
             .arg(program.clone())
-            .arg(pid.clone().required_unless_present("program"))
+            .arg(pid.clone())
             .arg(full_filenames.clone())
+            .arg(unwinder.clone())
             .arg(
                 Arg::new("output")
                     .short('o')
@@ -242,17 +284,19 @@ impl Config {
         let top = Command::new("top")
             .about("Display a top-like view of functions consuming CPU")
             .arg(program.clone())
-            .arg(pid.clone().required_unless_present("program"))
+            .arg(pid.clone())
             .arg(rate.clone())
             .arg(subprocesses.clone())
             .arg(full_filenames.clone())
+            .arg(unwinder.clone())
             .arg(idle.clone())
             .arg(top_delay.clone());
 
         let dump = Command::new("dump")
             .about("Dump stack traces for a target VM to stdout")
-            .arg(pid.clone().required(true))
+            .arg(pid.clone())
             .arg(full_filenames.clone())
+            .arg(unwinder.clone())
             .arg(
                 Arg::new("json")
                     .short('j')
@@ -356,6 +400,9 @@ impl Config {
                 });
 
         config.full_filenames = matches.get_flag("full_filenames");
+        if let Ok(Some(kind)) = matches.try_get_one::<UnwinderKind>("unwinder") {
+            config.unwinder = *kind;
+        }
         config.capture_output = config.command != "record" || matches.get_flag("capture");
         if !config.capture_output {
             config.hide_progress = true;
@@ -406,10 +453,11 @@ mod tests {
         let short_config = get_config("st-spy r -p 1234 -o foo").unwrap();
         assert_eq!(config, short_config);
 
-        assert_eq!(
-            get_config("st-spy record -o foo").unwrap_err().kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        // No pid and no program is now valid: the VM is auto-detected at
+        // runtime. Parsing succeeds with pid unset.
+        let no_pid = get_config("st-spy record -o foo").unwrap();
+        assert_eq!(no_pid.pid, None);
+        assert_eq!(no_pid.program, None);
 
         let program_config = get_config("st-spy r -o foo -- squeak Squeak.image").unwrap();
         assert_eq!(
@@ -442,10 +490,10 @@ mod tests {
         let short_config = get_config("st-spy d -p 1234").unwrap();
         assert_eq!(config, short_config);
 
-        assert_eq!(
-            get_config("st-spy dump").unwrap_err().kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        // `dump` with no pid is now valid (VM auto-detected at runtime).
+        let no_pid = get_config("st-spy dump").unwrap();
+        assert_eq!(no_pid.pid, None);
+        assert_eq!(no_pid.command, String::from("dump"));
     }
 
     #[test]

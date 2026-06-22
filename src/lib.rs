@@ -33,6 +33,8 @@ pub mod binary_parser;
 pub mod config;
 #[cfg(feature = "cli")]
 pub mod dump;
+#[cfg(all(feature = "unwind", target_os = "linux", target_arch = "x86_64"))]
+mod framehop_unwind;
 #[cfg(feature = "unwind")]
 mod native_stack_trace;
 pub mod sampler;

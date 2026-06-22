@@ -18,6 +18,88 @@ pub struct SmalltalkSpy {
     native: NativeStack,
     smalltalk_symbolizer: SmalltalkSymbolizer,
     short_filenames: HashMap<String, Option<String>>,
+    timing: PauseTiming,
+}
+
+/// Lightweight running statistics for how long the VM is suspended per sample.
+/// Logged periodically at info level so we can measure before optimizing.
+#[derive(Default)]
+struct PauseTiming {
+    samples: u64,
+    pause_total: std::time::Duration,
+    pause_min: std::time::Duration,
+    pause_max: std::time::Duration,
+    cog_total: std::time::Duration,
+    cog_max: std::time::Duration,
+    lock_total: std::time::Duration,
+    unwind_total: std::time::Duration,
+    detach_total: std::time::Duration,
+    last_report: Option<std::time::Instant>,
+    started: Option<std::time::Instant>,
+}
+
+impl PauseTiming {
+    fn record(
+        &mut self,
+        pause: std::time::Duration,
+        cog: std::time::Duration,
+        lock: std::time::Duration,
+        unwind: std::time::Duration,
+        detach: std::time::Duration,
+    ) {
+        if self.samples == 0 {
+            self.pause_min = pause;
+            self.pause_max = pause;
+            self.cog_max = cog;
+            self.last_report = Some(std::time::Instant::now());
+            self.started = Some(std::time::Instant::now());
+        } else {
+            if pause < self.pause_min {
+                self.pause_min = pause;
+            }
+            if pause > self.pause_max {
+                self.pause_max = pause;
+            }
+            if cog > self.cog_max {
+                self.cog_max = cog;
+            }
+        }
+        self.samples += 1;
+        self.pause_total += pause;
+        self.cog_total += cog;
+        self.lock_total += lock;
+        self.unwind_total += unwind;
+        self.detach_total += detach;
+
+        let report_due = self
+            .last_report
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(2))
+            .unwrap_or(true);
+        if report_due {
+            let n = self.samples as u32;
+            let avg = self.pause_total / n;
+            let window = self
+                .started
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(1.0)
+                .max(1e-9);
+            let duty = (self.pause_total.as_secs_f64() / window) * 100.0;
+            let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / self.samples as f64;
+            info!(
+                "{} samples | PAUSE avg={:.0}us (min={:.0} max={:.0}) [lock={:.0} cog={:.0} detach={:.0}] | off-lock walk+symbolize={:.0}us | duty~{:.1}%",
+                self.samples,
+                avg.as_secs_f64() * 1e6,
+                self.pause_min.as_secs_f64() * 1e6,
+                self.pause_max.as_secs_f64() * 1e6,
+                us(self.lock_total),
+                us(self.cog_total),
+                us(self.detach_total),
+                us(self.unwind_total),
+                duty,
+            );
+            self.last_report = Some(std::time::Instant::now());
+        }
+    }
 }
 
 impl SmalltalkSpy {
@@ -29,7 +111,7 @@ impl SmalltalkSpy {
         info!("OpenSmalltalk VM detected: {}", vm_info.vm_version);
 
         let smalltalk_symbolizer = SmalltalkSymbolizer::new(pid, &process, vm_info.binary.as_ref());
-        let native = NativeStack::new(pid)?;
+        let native = NativeStack::new(pid, config.unwinder)?;
 
         Ok(SmalltalkSpy {
             pid,
@@ -39,6 +121,7 @@ impl SmalltalkSpy {
             native,
             smalltalk_symbolizer,
             short_filenames: HashMap::new(),
+            timing: PauseTiming::default(),
         })
     }
 
@@ -72,22 +155,58 @@ impl SmalltalkSpy {
             thread_activity.insert(threadid, active);
         }
 
+        let lock_start = std::time::Instant::now();
         let _lock = if self.config.blocking == LockingStrategy::Lock {
             Some(self.process.lock().context("Failed to suspend process")?)
         } else {
             None
         };
+        let lock_time = lock_start.elapsed();
+        // Pause window starts here (VM suspended).
+        let pause_start = std::time::Instant::now();
+        let mut cog_walk_time = std::time::Duration::ZERO;
 
-        let mut traces = Vec::new();
+        // ---- Phase A: under the lock, capture only the raw data we need ----
+        // For framehop this is registers + a stack-memory copy per thread (no
+        // unwinding, no symbolization). Then we capture the Cog frame chain
+        // once (it walks the VM's global framePointer, independent of thread).
+        // Symbolization and the native frame walk are deferred to Phase B,
+        // which runs after the VM has resumed, because they touch only the
+        // on-disk ELF / symbol cache and the (frozen) stack copy -- never the
+        // live VM.
+        let mut captures: Vec<(Tid, bool, crate::native_stack_trace::ThreadCapture)> = Vec::new();
         for thread in self.process.threads()?.iter() {
             let thread_id = match thread.id() {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            let mut frames = self
+            let capture = self
                 .native
-                .thread_frames(thread)
-                .with_context(|| format!("Failed to unwind thread {thread_id}"))?;
+                .capture(thread)
+                .with_context(|| format!("Failed to capture thread {thread_id}"))?;
+            let active = *thread_activity.get(&thread_id).unwrap_or(&true);
+            captures.push((thread_id, active, capture));
+        }
+
+        // Capture the Cog frame chain once, under the lock. Cheap (~1us) and
+        // must be point-in-time consistent with the suspended VM.
+        let cog_start = std::time::Instant::now();
+        let cog_frames_snapshot = self.smalltalk_symbolizer.walk_cog_frames();
+        cog_walk_time += cog_start.elapsed();
+
+        let under_lock_time = pause_start.elapsed();
+        // Resume the VM: everything below reads only frozen/disk data.
+        let detach_start = std::time::Instant::now();
+        drop(_lock);
+        let detach_time = detach_start.elapsed();
+
+        // ---- Phase B: off the lock, walk + symbolize each captured thread ----
+        let mut unwind_time = std::time::Duration::ZERO;
+        let mut traces = Vec::new();
+        for (thread_id, active, capture) in captures {
+            let unwind_start = std::time::Instant::now();
+            let mut frames = self.native.resolve(capture);
+            unwind_time += unwind_start.elapsed();
 
             // Pass 1: Resolve JIT code addresses to Smalltalk method names.
             for frame in &mut frames {
@@ -108,7 +227,8 @@ impl SmalltalkSpy {
             // native stack -- they live in the Cog internal frame chain.  Detect
             // this boundary and splice in the Cog frames.
             if let Some(splice_pos) = Self::find_interpreter_boundary(&frames) {
-                let cog_frames = self.smalltalk_symbolizer.walk_cog_frames();
+                // Use the Cog frame chain captured under the lock (Phase A).
+                let cog_frames = cog_frames_snapshot.clone();
                 if !cog_frames.is_empty() {
                     // Collect names of Smalltalk frames already on the native
                     // stack so we can deduplicate.  The native unwinder may
@@ -173,11 +293,22 @@ impl SmalltalkSpy {
                 thread_id: thread_id as u64,
                 thread_name: None,
                 os_thread_id: Some(thread_id as u64),
-                active: *thread_activity.get(&thread_id).unwrap_or(&true),
+                active,
                 frames,
                 process_info: None,
             });
         }
+
+        // The pause window is now just Phase A (capture + cog-walk) plus the
+        // lock acquire/detach. The native walk + symbolization (unwind_time)
+        // happened after the VM resumed and is NOT part of the pause.
+        self.timing.record(
+            lock_time + under_lock_time + detach_time,
+            cog_walk_time,
+            lock_time,
+            unwind_time,
+            detach_time,
+        );
 
         Ok(traces)
     }

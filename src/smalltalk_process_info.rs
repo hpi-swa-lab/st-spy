@@ -19,6 +19,70 @@ pub struct SmalltalkProcessInfo {
     pub vm_version: String,
 }
 
+/// Returns true if the executable/command name looks like it might be an
+/// OpenSmalltalk VM. Cheap pre-filter so we only do the expensive binary
+/// parsing on plausible candidates.
+fn name_looks_like_vm(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("squeak")
+        || lower.contains("opensmalltalk")
+        || lower.contains("pharo")
+        || lower.contains("spur")
+        || lower.contains("cogspur")
+        || lower.ends_with("/cog")
+        || lower == "cog"
+}
+
+/// Scan running processes and return the PID of the first one that looks like a
+/// running OpenSmalltalk VM. Used when the user runs st-spy without specifying
+/// a --pid (the common case: exactly one VM is open).
+///
+/// We cheaply pre-filter on the executable name, then confirm each candidate by
+/// actually inspecting it as a VM (same check used when attaching). Returns all
+/// confirmed VM pids so the caller can warn if there's ambiguity.
+pub fn find_vm_processes() -> Vec<remoteprocess::Pid> {
+    let mut found = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return found;
+        };
+        let self_pid = std::process::id() as i32;
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_owned()) else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<remoteprocess::Pid>() else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+
+            // Cheap pre-filter: read /proc/<pid>/comm and the exe link.
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_owned()))
+                .unwrap_or_default();
+            if !name_looks_like_vm(comm.trim()) && !name_looks_like_vm(&exe) {
+                continue;
+            }
+
+            // Confirm it's really a VM by inspecting it.
+            if let Ok(process) = remoteprocess::Process::new(pid) {
+                if SmalltalkProcessInfo::new(&process).is_ok() {
+                    found.push(pid);
+                }
+            }
+        }
+    }
+
+    found.sort_unstable();
+    found
+}
+
 impl SmalltalkProcessInfo {
     pub fn new(process: &remoteprocess::Process) -> Result<SmalltalkProcessInfo, Error> {
         let executable = process.exe().context("Failed to find process executable")?;

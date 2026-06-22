@@ -5,41 +5,137 @@ use cpp_demangle::{BorrowedSymbol, DemangleOptions};
 use lru::LruCache;
 use remoteprocess::{self, Pid};
 
+use crate::config::UnwinderKind;
 use crate::stack_trace::Frame;
 use crate::utils::resolve_filename;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::framehop_unwind::Framehop;
+
+/// The address-producing backend.  Both produce a `Vec<u64>` of return
+/// addresses; symbolication afterwards is identical.
+enum Backend {
+    Libunwind(remoteprocess::Unwinder),
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Framehop(Framehop),
+}
+
+/// Result of the under-lock capture phase. Libunwind must unwind while the
+/// target is suspended, so it already holds resolved addresses. Framehop only
+/// copied registers + stack and defers the actual walk to the off-lock resolve
+/// phase.
+pub enum ThreadCapture {
+    Addresses(Vec<u64>),
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Snapshot(crate::framehop_unwind::StackSnapshot),
+}
+
 pub struct NativeStack {
     should_reload: bool,
-    unwinder: remoteprocess::Unwinder,
+    backend: Backend,
     symbolicator: remoteprocess::Symbolicator,
-    // On Windows, unwinding needs the process handle to stay alive.
     #[allow(dead_code)]
+    pid: Pid,
+    /// Captures since the last framehop module refresh. We refresh periodically
+    /// (not per-sample) so newly dlopen'd libraries get unwind info without
+    /// paying the maps-parse + ELF-read cost on the hot path.
+    captures_since_reload: u32,
+    // On Windows, unwinding needs the process handle to stay alive.
     process: remoteprocess::Process,
     symbol_cache: LruCache<u64, remoteprocess::StackFrame>,
 }
 
 impl NativeStack {
-    pub fn new(pid: Pid) -> Result<NativeStack, Error> {
+    pub fn new(pid: Pid, kind: UnwinderKind) -> Result<NativeStack, Error> {
         let process = remoteprocess::Process::new(pid)?;
-        let unwinder = process.unwinder()?;
         let symbolicator = process.symbolicator()?;
 
+        let backend = match kind {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            UnwinderKind::framehop => {
+                info!("using framehop native unwinder");
+                Backend::Framehop(Framehop::new(pid)?)
+            }
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            UnwinderKind::framehop => {
+                info!("framehop unwinder unavailable on this platform; using libunwind");
+                Backend::Libunwind(process.unwinder()?)
+            }
+            UnwinderKind::libunwind => {
+                info!("using libunwind native unwinder");
+                Backend::Libunwind(process.unwinder()?)
+            }
+        };
+
         Ok(NativeStack {
-            unwinder,
+            backend,
             symbolicator,
+            captures_since_reload: 0,
             should_reload: false,
+            pid,
             process,
             symbol_cache: LruCache::new(NonZeroUsize::new(65536).unwrap()),
         })
     }
 
-    pub fn thread_frames(&mut self, thread: &remoteprocess::Thread) -> Result<Vec<Frame>, Error> {
-        if self.should_reload {
-            self.symbolicator.reload()?;
-            self.should_reload = false;
+    /// Phase A (under lock): grab the minimum needed to unwind a thread later.
+    /// For libunwind this still unwinds immediately (it has no off-lock mode);
+    /// for framehop this only copies registers + stack, deferring the walk.
+    pub fn capture(&mut self, thread: &remoteprocess::Thread) -> Result<ThreadCapture, Error> {
+        // Periodically refresh framehop's module list so dlopen'd libraries get
+        // unwind info. Cheap amortized: once every REFRESH captures, not each.
+        // (Native symbolicator reload is deferred to resolve(), off the lock.)
+        const FRAMEHOP_REFRESH_INTERVAL: u32 = 2000;
+        self.captures_since_reload += 1;
+        if self.captures_since_reload >= FRAMEHOP_REFRESH_INTERVAL {
+            self.reload_backend();
+            self.captures_since_reload = 0;
         }
 
-        let native_stack = self.get_thread(thread)?;
+        match &mut self.backend {
+            Backend::Libunwind(unwinder) => {
+                let mut addrs = Vec::new();
+                for ip in unwinder.cursor(thread)? {
+                    addrs.push(ip?);
+                }
+                Ok(ThreadCapture::Addresses(addrs))
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Backend::Framehop(fh) => {
+                let tid = thread.id()? as Pid;
+                let snap = fh.capture(&self.process, tid)?;
+                Ok(ThreadCapture::Snapshot(snap))
+            }
+        }
+    }
+
+    /// Phase B (off lock): turn a capture into symbolized frames. For framehop
+    /// this performs the actual stack walk against the copied buffer; for both
+    /// backends it symbolizes the resulting addresses. Touches only the disk
+    /// ELF / symbol cache, never the live (now-resumed) target.
+    pub fn resolve(&mut self, capture: ThreadCapture) -> Vec<Frame> {
+        // Reload native symbol info if a previous sample saw an unknown address.
+        // Done here (off the lock) rather than in capture(), since it only
+        // affects symbolication and reads on-disk data, not the live target.
+        if self.should_reload {
+            if let Err(e) = self.symbolicator.reload() {
+                debug!("symbolicator reload failed: {e}");
+            }
+            self.should_reload = false;
+        }
+        let addrs = match capture {
+            ThreadCapture::Addresses(a) => a,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            ThreadCapture::Snapshot(snap) => match &mut self.backend {
+                Backend::Framehop(fh) => fh.unwind_snapshot(&snap),
+                // Shouldn't happen: snapshots only come from framehop.
+                Backend::Libunwind(_) => Vec::new(),
+            },
+        };
+        self.symbolize_addresses(addrs)
+    }
+
+    fn symbolize_addresses(&mut self, native_stack: Vec<u64>) -> Vec<Frame> {
         let mut frames = Vec::new();
         for addr in native_stack {
             let cached_symbol = self.symbol_cache.get(&addr).cloned();
@@ -84,7 +180,7 @@ impl NativeStack {
             }
         }
 
-        Ok(frames)
+        frames
     }
 
     /// Translates a native frame into an optional frame. None indicates we should ignore it.
@@ -129,12 +225,15 @@ impl NativeStack {
         }
     }
 
-    fn get_thread(&mut self, thread: &remoteprocess::Thread) -> Result<Vec<u64>, Error> {
-        let mut stack = Vec::new();
-        for ip in self.unwinder.cursor(thread)? {
-            stack.push(ip?);
+    /// Re-scan modules when the symbolicator reloaded (e.g. after dlopen) so
+    /// framehop learns about newly mapped libraries.
+    fn reload_backend(&mut self) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Backend::Framehop(fh) = &mut self.backend {
+            if let Err(e) = fh.load_modules() {
+                debug!("framehop module reload failed: {e}");
+            }
         }
-        Ok(stack)
     }
 }
 

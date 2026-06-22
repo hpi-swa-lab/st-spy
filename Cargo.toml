@@ -53,6 +53,10 @@ rand = "0.9"
 rand_distr = "0.5"
 remoteprocess = "0.5.2"
 chrono = "0.4.44"
+framehop = "0.16"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["ptrace"] }
 
 [target.'cfg(unix)'.dependencies]
 termios = "0.3.3"

@@ -9,6 +9,8 @@ mod config;
 mod console_viewer;
 mod dump;
 mod flamegraph;
+#[cfg(all(feature = "unwind", target_os = "linux", target_arch = "x86_64"))]
+mod framehop_unwind;
 #[cfg(feature = "unwind")]
 mod native_stack_trace;
 mod sampler;
@@ -384,6 +386,34 @@ fn stspy_main() -> Result<(), Error> {
 
     if let Some(pid) = config.pid {
         run_spy_command(pid, &config)?;
+    } else if config.program.is_none() {
+        // No --pid and no program given: auto-detect a running OpenSmalltalk VM.
+        let vms = smalltalk_process_info::find_vm_processes();
+        match vms.as_slice() {
+            [] => {
+                return Err(format_err!(
+                    "No running OpenSmalltalk VM found. Specify one with --pid <pid>, \
+                     or launch one with: st-spy {} -- <vm> <image>",
+                    config.command
+                ));
+            }
+            [pid] => {
+                info!("Auto-detected OpenSmalltalk VM at pid {pid}");
+                eprintln!("st-spy> No --pid given; using detected VM at pid {pid}.");
+                run_spy_command(*pid, &config)?;
+            }
+            many => {
+                let list = many
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format_err!(
+                    "Multiple OpenSmalltalk VMs found (pids: {list}). \
+                     Disambiguate with --pid <pid>."
+                ));
+            }
+        }
     } else if let Some(ref subprocess) = config.program {
         // Dump out stdout/stderr from the process to a temp file, so we can view it later if needed
         let mut process_output = tempfile::NamedTempFile::new()?;

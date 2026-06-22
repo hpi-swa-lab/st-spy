@@ -1,17 +1,17 @@
-# Callout Stack Stitching
+# Callout stack stitching
 
 When the Squeak VM calls a C primitive or FFI function, the Smalltalk call
 chain that led to the callout becomes invisible to a native stack unwinder.
 This document explains why, and how st-spy fixes it.
 
-## The Problem
+## The problem
 
 The Cog JIT compiles Smalltalk methods into native machine code.  When those
 methods are executing, their frames sit on the OS stack and libunwind can
-walk them normally -- st-spy resolves the instruction pointers via the method
+walk them normally: st-spy resolves the instruction pointers via the method
 zone and everything works.
 
-But when the VM enters a **primitive** or **FFI callout**, control transfers
+But when the VM enters a primitive or FFI callout, control transfers
 from JIT-compiled code into the C interpreter loop and then into the
 primitive's C implementation.  At this transition the VM saves the current
 Smalltalk frame pointer into a global variable (`framePointer`) and sets up
@@ -25,16 +25,16 @@ Cog cePrimReturnEnterCogCode
                            *** gap -- no Smalltalk callers ***
 ```
 
-The Smalltalk methods that *called* the primitive (`SWAGameXR>>renderOn:`,
+The Smalltalk methods that called the primitive (`SWAGameXR>>renderOn:`,
 `SRWorld>>render:`, etc.) are not on the OS stack.  They exist only in the
-Cog internal frame chain -- a linked list of frames in VM-managed stack page
+Cog internal frame chain, a linked list of frames in VM-managed stack page
 memory, anchored by the `framePointer` global.
 
 A pure native unwinder like libunwind cannot see these frames.  The result
 is a disconnected flamegraph: wide islands of C code at the top with no
 shared Smalltalk root.
 
-## Cog Frame Layout (x86-64, 64-bit Spur)
+## Cog frame layout (x86-64, 64-bit Spur)
 
 Each Cog stack frame is laid out relative to a frame pointer (FP):
 
@@ -46,35 +46,27 @@ FP[-24]  receiver (machine-code frames)
 FP[-40]  receiver (interpreter frames)
 ```
 
-The **method field** at `FP[-8]` distinguishes two frame types:
-
-- **JIT frame** (`method < heapBase`): the value is a pointer to a
-  `CogMethod` header in the method zone.  The method name can be resolved
-  the same way st-spy already resolves JIT PCs -- by reading the selector
-  and class from the CogMethod's `methodObject`.
-
-- **Interpreted frame** (`method >= heapBase`): the value is a Smalltalk
-  context OOP.  The context's slot 3 (`oop + 8 + 3*8 = oop + 32`) holds the
-  CompiledMethod, from which the selector and class can be read via the
-  literal frame.
+The method field at `FP[-8]` distinguishes two frame types.  A JIT frame
+(`method < heapBase`) stores a pointer to a `CogMethod` header in the method
+zone, and the method name is resolved the same way st-spy already resolves JIT
+PCs, by reading the selector and class from the CogMethod's `methodObject`.  An
+interpreted frame (`method >= heapBase`) stores a Smalltalk context OOP, whose
+slot 3 (`oop + 8 + 3*8 = oop + 32`) holds the CompiledMethod, from which the
+selector and class can be read via the literal frame.
 
 Walking the chain is straightforward: read `FP[0]` to get the caller's FP,
 repeat until zero (bottom of stack page).
 
-## VM Globals
+## VM globals
 
-Two BSS symbols in the Squeak binary provide the entry points:
-
-| Symbol          | Purpose                                           |
-|-----------------|---------------------------------------------------|
-| `framePointer`  | Current Cog frame pointer (set before entering C) |
-| `heapBase`      | Start of the Spur object heap (discriminator)     |
-
-These are found the same way st-spy already finds `baseAddress` and
-`mzFreeStart` -- by name in the ELF symbol table.  The symbolizer reads
+Two BSS symbols in the Squeak binary provide the entry points.  `framePointer`
+holds the current Cog frame pointer, set before the VM enters C, and `heapBase`
+is the start of the Spur object heap, which we use to tell JIT and interpreted
+frames apart.  These are found the same way st-spy already finds `baseAddress`
+and `mzFreeStart`, by name in the ELF symbol table, and the symbolizer reads
 their values from the target process via `copy_struct`.
 
-## The Fix
+## The fix
 
 The fix has three parts: walking the Cog frame chain, detecting where to
 splice, and unifying the flamegraph root.
@@ -101,7 +93,7 @@ returned in caller order (innermost first).
 ### 2. Detect the boundary (`SmalltalkSpy::find_interpreter_boundary`)
 
 Added to `smalltalk_spy.rs`.  After the existing pass that resolves JIT PCs
-in native frames, a second pass scans for the transition point -- frames
+in native frames, a second pass scans for the transition point, frames
 like:
 
 - `Cog cePrimReturnEnterCogCode`, `Cog ceBaseFrameReturn` (Cog trampolines)
@@ -122,16 +114,16 @@ the Cog frame chain (e.g. the current method was executing a primitive like
 1. Collects the names of all Smalltalk method frames already on the native
    stack.
 2. Truncates any trailing native Smalltalk/Cog/JIT frames after the
-   boundary -- these will be replaced by the (more complete) Cog chain.
+   boundary, since these will be replaced by the (more complete) Cog chain.
 3. Filters out Cog chain frames that duplicate native frames before the
    boundary.
 4. Appends a synthetic `Cog ceBaseFrameReturn` frame as the root.
 
-This ensures that *all* Smalltalk stacks -- whether captured via the native
-JIT unwind or via Cog frame stitching -- share a single root in the
+This ensures that all Smalltalk stacks, whether captured via the native
+JIT unwind or via Cog frame stitching, share a single root in the
 flamegraph, producing one unified tree instead of disconnected islands.
 
-### 4. Heuristic: when NOT to splice
+### 4. Heuristic: when not to splice
 
 If the native unwind already captured more than 3 Smalltalk method frames
 (not counting `Cog *` trampolines or `JIT *` PICs), the chain is
@@ -172,11 +164,11 @@ The flamegraph now shows a single unified tree.  All Smalltalk stacks
 share `Cog ceBaseFrameReturn` as their root, whether they were captured
 via native JIT unwinding or Cog frame stitching.
 
-## Files Changed
+## Files changed
 
-- `src/smalltalk_symbolizer.rs` -- `CogFrameSymbols` struct,
+- `src/smalltalk_symbolizer.rs`: `CogFrameSymbols` struct,
   `walk_cog_frames()`, `resolve_frame_method()`, frame chain constants
-- `src/smalltalk_spy.rs` -- `find_interpreter_boundary()`, splice and
+- `src/smalltalk_spy.rs`: `find_interpreter_boundary()`, splice and
   deduplication logic in `get_stack_traces()`
 
 ## Limitations
