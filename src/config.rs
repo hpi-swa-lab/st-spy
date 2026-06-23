@@ -43,6 +43,11 @@ pub struct Config {
     pub dump_json: bool,
     #[doc(hidden)]
     pub full_filenames: bool,
+    /// Trim trailing non-Smalltalk frames (VM/JIT/native runtime) from the root
+    /// of each stack so the flamegraph is rooted in Smalltalk methods. Native
+    /// frames are still kept when they appear as leaves or intermediate nodes
+    /// (e.g. FFI callouts). Default true; pass --keep-native-roots to disable.
+    pub hide_native_roots: bool,
     #[doc(hidden)]
     pub refresh_seconds: f64,
     #[doc(hidden)]
@@ -132,6 +137,7 @@ impl Default for Config {
             dump_json: false,
             subprocesses: false,
             full_filenames: false,
+            hide_native_roots: true,
             refresh_seconds: 1.0,
             unwinder: UnwinderKind::platform_default(),
         }
@@ -183,6 +189,16 @@ impl Config {
             .help("Show full source filenames instead of shortening to the basename")
             .action(ArgAction::SetTrue);
 
+        let keep_native_roots = Arg::new("keep_native_roots")
+            .long("keep-native-roots")
+            .help(
+                "Keep non-Smalltalk frames (VM/JIT/native runtime) at the root of stacks. \
+                 By default these trailing native roots are trimmed so stacks are rooted in \
+                 Smalltalk methods; native frames are still shown as leaves/intermediate nodes \
+                 (e.g. FFI callouts). Use this for comparison with the raw native rooting.",
+            )
+            .action(ArgAction::SetTrue);
+
         let unwinder = Arg::new("unwinder")
             .long("unwinder")
             .value_name("backend")
@@ -220,6 +236,7 @@ impl Config {
             .arg(program.clone())
             .arg(pid.clone())
             .arg(full_filenames.clone())
+            .arg(keep_native_roots.clone())
             .arg(unwinder.clone())
             .arg(
                 Arg::new("output")
@@ -288,6 +305,7 @@ impl Config {
             .arg(rate.clone())
             .arg(subprocesses.clone())
             .arg(full_filenames.clone())
+            .arg(keep_native_roots.clone())
             .arg(unwinder.clone())
             .arg(idle.clone())
             .arg(top_delay.clone());
@@ -296,6 +314,7 @@ impl Config {
             .about("Dump stack traces for a target VM to stdout")
             .arg(pid.clone())
             .arg(full_filenames.clone())
+            .arg(keep_native_roots.clone())
             .arg(unwinder.clone())
             .arg(
                 Arg::new("json")
@@ -400,6 +419,7 @@ impl Config {
                 });
 
         config.full_filenames = matches.get_flag("full_filenames");
+        config.hide_native_roots = !matches.get_flag("keep_native_roots");
         if let Ok(Some(kind)) = matches.try_get_one::<UnwinderKind>("unwinder") {
             config.unwinder = *kind;
         }
@@ -511,6 +531,31 @@ mod tests {
         assert_eq!(
             get_config("st-spy dude").unwrap_err().kind(),
             clap::error::ErrorKind::InvalidSubcommand
+        );
+    }
+
+    #[test]
+    fn test_hide_native_roots_default_and_flag() {
+        // Trimming native roots is the default for every subcommand.
+        assert!(get_config("st-spy record -p 1234 -o foo").unwrap().hide_native_roots);
+        assert!(get_config("st-spy top -p 1234").unwrap().hide_native_roots);
+        assert!(get_config("st-spy dump -p 1234").unwrap().hide_native_roots);
+
+        // --keep-native-roots restores the raw native rooting for comparison.
+        assert!(
+            !get_config("st-spy record -p 1234 -o foo --keep-native-roots")
+                .unwrap()
+                .hide_native_roots
+        );
+        assert!(
+            !get_config("st-spy top -p 1234 --keep-native-roots")
+                .unwrap()
+                .hide_native_roots
+        );
+        assert!(
+            !get_config("st-spy dump -p 1234 --keep-native-roots")
+                .unwrap()
+                .hide_native_roots
         );
     }
 }

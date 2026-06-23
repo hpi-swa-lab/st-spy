@@ -288,6 +288,17 @@ impl SmalltalkSpy {
                 }
             }
 
+            // Optionally trim trailing non-Smalltalk frames from the root so
+            // each stack is rooted in a real Smalltalk method. Native/VM/JIT
+            // frames are still kept when they are leaves or intermediate nodes
+            // (e.g. FFI callouts deeper in the stack). This collapses the
+            // various JIT/native entry roots into a single shared Smalltalk
+            // root and removes the duplicate-looking method roots that arise
+            // from the JIT entry loop.
+            if self.config.hide_native_roots {
+                Self::trim_native_roots(&mut frames);
+            }
+
             traces.push(StackTrace {
                 pid: self.pid,
                 thread_id: thread_id as u64,
@@ -390,6 +401,30 @@ impl SmalltalkSpy {
 
         // Return the position *after* the deepest boundary frame.
         boundary.map(|b| b + 1)
+    }
+
+    /// Whether a frame is a real Smalltalk method (a `Class>>selector` resolved
+    /// from the image), as opposed to a synthetic Cog trampoline / JIT helper or
+    /// a native VM/C frame. Mirrors the "deep Smalltalk" test used elsewhere.
+    fn is_smalltalk_method(frame: &Frame) -> bool {
+        frame.filename == "Smalltalk"
+            && !frame.name.starts_with("Cog ")
+            && !frame.name.starts_with("JIT ")
+    }
+
+    /// Trim trailing non-Smalltalk frames (toward the root) so the stack is
+    /// rooted in a Smalltalk method. Frames are stored innermost-first, so the
+    /// root is the tail of the vector. We drop tail frames until the last one is
+    /// a real Smalltalk method. Native frames remain untouched when they sit
+    /// below a Smalltalk method (i.e. as leaves or intermediate nodes), so FFI
+    /// callouts and the like are preserved.
+    ///
+    /// If a stack contains no Smalltalk method at all (e.g. a pure VM-internal
+    /// thread), it is left unchanged rather than emptied.
+    fn trim_native_roots(frames: &mut Vec<Frame>) {
+        if let Some(last_st) = frames.iter().rposition(Self::is_smalltalk_method) {
+            frames.truncate(last_st + 1);
+        }
     }
 }
 
