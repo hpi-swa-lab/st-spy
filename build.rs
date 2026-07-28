@@ -1,7 +1,7 @@
 use std::env;
 
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(use_libunwind)");
+    println!("cargo::rustc-check-cfg=cfg(unwind)");
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     match (target_arch.as_ref(), target_os.as_ref()) {

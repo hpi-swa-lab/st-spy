@@ -107,7 +107,19 @@ impl SmalltalkSpy {
             // primitive/FFI callout, the Smalltalk caller frames are NOT on the
             // native stack -- they live in the Cog internal frame chain.  Detect
             // this boundary and splice in the Cog frames.
-            if let Some(splice_pos) = Self::find_interpreter_boundary(&frames) {
+            //
+            // The Cog frame chain is anchored by a single process-wide global
+            // (`framePointer`), not a per-thread one -- it reflects whichever
+            // Smalltalk process is currently executing, on whichever OS thread
+            // that happens to be.  Only attempt the splice for the thread that
+            // was actually running at sample time; otherwise every OS thread in
+            // the process (I/O helpers, GC, etc.) would get an identical copy
+            // of that one thread's call chain spliced onto it.
+            let is_active = *thread_activity.get(&thread_id).unwrap_or(&true);
+            if let Some(splice_pos) = is_active
+                .then(|| Self::find_interpreter_boundary(&frames))
+                .flatten()
+            {
                 let cog_frames = self.smalltalk_symbolizer.walk_cog_frames();
                 if !cog_frames.is_empty() {
                     // Collect names of Smalltalk frames already on the native

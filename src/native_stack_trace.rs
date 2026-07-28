@@ -1,5 +1,5 @@
 // Full native unwinding: Linux with libunwind, Windows.
-#[cfg(any(use_libunwind, windows))]
+#[cfg(any(unwind, windows))]
 mod native {
     use std::num::NonZeroUsize;
 
@@ -169,7 +169,7 @@ mod native {
 }
 
 // Stub for platforms without native unwinding (macOS, Linux without libunwind).
-#[cfg(not(any(use_libunwind, windows)))]
+#[cfg(not(any(unwind, windows)))]
 mod native {
     use anyhow::Error;
     use remoteprocess::Pid;
