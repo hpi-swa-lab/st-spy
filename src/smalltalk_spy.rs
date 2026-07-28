@@ -29,7 +29,7 @@ impl SmalltalkSpy {
         info!("OpenSmalltalk VM detected: {}", vm_info.vm_version);
 
         let smalltalk_symbolizer = SmalltalkSymbolizer::new(pid, &process, vm_info.binary.as_ref());
-        let native = NativeStack::new(pid)?;
+        let native = NativeStack::new(pid, config.show_line_numbers)?;
 
         Ok(SmalltalkSpy {
             pid,

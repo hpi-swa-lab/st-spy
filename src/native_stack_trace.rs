@@ -2,6 +2,7 @@
 #[cfg(any(unwind, windows))]
 mod native {
     use std::num::NonZeroUsize;
+    use std::time::{Duration, Instant};
 
     use anyhow::Error;
     use cpp_demangle::{BorrowedSymbol, DemangleOptions};
@@ -11,8 +12,19 @@ mod native {
     use crate::stack_trace::Frame;
     use crate::utils::resolve_filename;
 
+    // Reloading re-scans every memory mapping of the target process, which
+    // can be expensive on processes with a large, fragmented address space
+    // (e.g. a GPU-heavy macOS app with hundreds of driver/framework
+    // mappings). Multiple threads can each independently flag a reload
+    // within the same sample, so without a cooldown this can fire far more
+    // often than the sampling rate can tolerate. A newly-mapped binary just
+    // shows raw addresses until the next reload is due.
+    const RELOAD_COOLDOWN: Duration = Duration::from_millis(250);
+
     pub struct NativeStack {
         should_reload: bool,
+        last_reload: Option<Instant>,
+        line_info: bool,
         unwinder: remoteprocess::Unwinder,
         symbolicator: remoteprocess::Symbolicator,
         #[allow(dead_code)]
@@ -21,7 +33,7 @@ mod native {
     }
 
     impl NativeStack {
-        pub fn new(pid: Pid) -> Result<NativeStack, Error> {
+        pub fn new(pid: Pid, line_info: bool) -> Result<NativeStack, Error> {
             let process = remoteprocess::Process::new(pid)?;
             let unwinder = process.unwinder()?;
             let symbolicator = process.symbolicator()?;
@@ -30,6 +42,8 @@ mod native {
                 unwinder,
                 symbolicator,
                 should_reload: false,
+                last_reload: None,
+                line_info,
                 process,
                 symbol_cache: LruCache::new(NonZeroUsize::new(65536).unwrap()),
             })
@@ -40,8 +54,14 @@ mod native {
             thread: &remoteprocess::Thread,
         ) -> Result<Vec<Frame>, Error> {
             if self.should_reload {
-                self.symbolicator.reload()?;
-                self.should_reload = false;
+                let due = self
+                    .last_reload
+                    .is_none_or(|t| t.elapsed() >= RELOAD_COOLDOWN);
+                if due {
+                    self.symbolicator.reload()?;
+                    self.last_reload = Some(Instant::now());
+                    self.should_reload = false;
+                }
             }
 
             let native_stack = self.get_thread(thread)?;
@@ -58,7 +78,7 @@ mod native {
                 let mut symbolicated_count = 0;
                 let mut first_frame = None;
                 self.symbolicator
-                    .symbolicate(addr, true, &mut |frame: &remoteprocess::StackFrame| {
+                    .symbolicate(addr, self.line_info, &mut |frame: &remoteprocess::StackFrame| {
                         symbolicated_count += 1;
                         if symbolicated_count == 1 {
                             first_frame = Some(frame.clone());
@@ -166,6 +186,20 @@ mod native {
         }
         false
     }
+
+    #[cfg(target_os = "macos")]
+    fn ignore_frame(function: &str, module: &str) -> bool {
+        if function == "_start" && module.contains("/libdyld.dylib") {
+            return true;
+        }
+        if function == "__pthread_body" && module.contains("/libsystem_pthread") {
+            return true;
+        }
+        if function == "_thread_start" && module.contains("/libsystem_pthread") {
+            return true;
+        }
+        false
+    }
 }
 
 // Stub for platforms without native unwinding (macOS, Linux without libunwind).
@@ -179,7 +213,7 @@ mod native {
     pub struct NativeStack;
 
     impl NativeStack {
-        pub fn new(_pid: Pid) -> Result<NativeStack, Error> {
+        pub fn new(_pid: Pid, _line_info: bool) -> Result<NativeStack, Error> {
             Ok(NativeStack)
         }
 
