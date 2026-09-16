@@ -23,6 +23,16 @@ Note: `st-spy` is derived from `py-spy` and keeps the MIT license.
 
 ## Build
 
+<details><summary>Linux dependencies</summary>
+On Debian/Ubuntu, install the required native libraries first:
+
+```bash
+sudo apt install libunwind-dev liblzma-dev
+```
+
+Then:
+</details>
+
 ```bash
 cargo build --release
 ```
